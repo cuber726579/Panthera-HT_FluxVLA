@@ -130,6 +130,42 @@ class FeedbackAndThread(unittest.TestCase):
         controller.robot.Joint_Pos_Vel.assert_not_called()
         controller.robot.set_stop.assert_called_once()
 
+    def test_rollout_velocity_tracks_sent_targets_and_is_zero_while_holding(self):
+        controller, _ = self.controller()
+        controller.args.mode = 'rollout'
+        controller.args.max_torque = [21, 36, 36, 21, 10, 10]
+        controller.args.gripper_velocity = controller.args.gripper_torque = .5
+        controller.stop_event, controller.ready = threading.Event(), threading.Event()
+        controller.lock = threading.Lock()
+        controller.last_target, controller.error = None, None
+        controller.commands = queue.Queue()
+        goal = np.array([.003, -.004, 0., .2, -.2, .001, 0.])
+        acknowledgements = [threading.Event(), threading.Event()]
+
+        def next_tick(_):
+            tick = controller.robot.Joint_Pos_Vel.call_count
+            if tick == 1:  # Initial measured-pose hold, then a mixed-direction move.
+                controller.commands.put((controller.mapping.to_policy(goal), acknowledgements[0]))
+            elif tick == 3:  # Tick 3 repeats the target despite nonzero encoder error.
+                controller.commands.put((controller.mapping.to_policy(np.zeros(7)), acknowledgements[1]))
+            elif tick == 4:
+                controller.stop_event.set()
+
+        with patch.object(controller.stop_event, 'wait', side_effect=next_tick):
+            controller._run()
+
+        self.assertIsNone(controller.error)
+        calls = controller.robot.Joint_Pos_Vel.call_args_list
+        self.assertEqual(len(calls), 4)
+        sent = [.003, -.004, 0., .01, -.01, .001]
+        velocity = np.array([.09, -.12, 0., .3, -.3, .03])
+        for call, position, speed in zip(calls, [np.zeros(6), sent, sent, np.zeros(6)],
+                                        [np.zeros(6), velocity, np.zeros(6), -velocity]):
+            np.testing.assert_allclose(call.args[0], position, atol=1e-12)
+            np.testing.assert_allclose(call.args[1], speed, atol=1e-12)
+        self.assertTrue(all(event.is_set() for event in acknowledgements))
+        controller.robot.set_stop.assert_called_once()
+
 
 def camera_args(**overrides):
     values = dict(head_serial='head', wrist_serial='wrist', camera_width=8,

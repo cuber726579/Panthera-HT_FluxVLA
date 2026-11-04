@@ -609,7 +609,12 @@ class RobotControl:
                 if active:
                     if np.max(np.abs(target[:6] - measured[:6])) > self.args.max_tracking_error:
                         raise ValueError('Tracking error exceeds configured limit')
-                    if not self.robot.Joint_Pos_Vel(target[:6], [self.args.command_velocity] * 6,
+                    # Differentiate consecutive SDK targets at the control rate,
+                    # not encoder error. Repeated hold targets have zero velocity.
+                    target_velocity = np.clip(
+                        (target[:6] - self.last_target[:6]) * self.args.control_hz,
+                        -self.args.command_velocity, self.args.command_velocity)
+                    if not self.robot.Joint_Pos_Vel(target[:6], target_velocity,
                                                     self.args.max_torque, iswait=False):
                         raise RuntimeError('SDK rejected joint command')
                     if not self.robot.gripper_control(target[6], self.args.gripper_velocity,

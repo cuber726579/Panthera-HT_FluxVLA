@@ -47,7 +47,10 @@ GRIPPER_VELOCITY=0.5
 GRIPPER_TORQUE=0.5
 MAX_GRIPPER_STEP=0.05              # 每控制周期，模型归一化单位
 LOG_ROOT="$ROOT/deploy/runs"
-SAVE_OBSERVATIONS=0                # 1: 保存每次推理的原始 RGB 和 state npz
+SAVE_OBSERVATIONS=1                # 1: 持续保存两路相机每帧无损 PNG/帧号/时间戳，并保留推理输入 npz
+RECORDING_QUEUE_SIZE=128           # 两路共享的写盘队列帧数；满时明确报错并停止，不静默丢帧
+RECORDING_PNG_COMPRESSION=0         # 0..9 均无损；0 不压缩，优先保证双路 30 FPS 写盘速度
+RECORDING_FLUSH_TIMEOUT_S=30        # 退出时停止采集，再等待已接收帧写完；超时报告保存不完整
 
 # 使用方式：bash deploy/rollout_panthera.sh [check|smoke|dry-run|rollout]
 # check: 依赖、权重头、预处理检查；smoke: 真实 CUDA + 合成观测，都不打开硬件。
@@ -85,4 +88,7 @@ exec "$CONDA_ROOT/envs/$ROBOT_ENV/bin/python" "$ROOT/deploy/rollout_panthera.py"
   --gripper-closed "$GRIPPER_CLOSED" --gripper-open "$GRIPPER_OPEN" \
   --gripper-velocity "$GRIPPER_VELOCITY" --gripper-torque "$GRIPPER_TORQUE" \
   --max-gripper-step "$MAX_GRIPPER_STEP" \
-  --log-root "$LOG_ROOT" --save-observations "$SAVE_OBSERVATIONS"
+  --log-root "$LOG_ROOT" --save-observations "$SAVE_OBSERVATIONS" \
+  --recording-queue-size "$RECORDING_QUEUE_SIZE" \
+  --recording-png-compression "$RECORDING_PNG_COMPRESSION" \
+  --recording-flush-timeout-s "$RECORDING_FLUSH_TIMEOUT_S"

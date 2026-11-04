@@ -210,11 +210,104 @@ class PolicyProcess:
         self.selector.close()
 
 
+class FrameRecorder:
+    """Bounded, asynchronous lossless RGB recording, independent of inference."""
+    keys = ('cam_high', 'cam_left_wrist')
+
+    def __init__(self, directory, args):
+        import cv2
+        self.cv2, self.args = cv2, args
+        self.directory = Path(directory) / 'camera_frames'
+        for key in self.keys:
+            (self.directory / key).mkdir(parents=True, exist_ok=True)
+        self.queue = queue.Queue(maxsize=args.recording_queue_size)
+        self.closing = threading.Event()
+        self.lock, self.close_lock = threading.Lock(), threading.Lock()
+        self.error = None
+        self.closed = False
+        self.counts = {key: dict(received=0, saved=0, missing_frame_numbers=0)
+                       for key in self.keys}
+        self.thread = threading.Thread(target=self._write, name='camera-recorder', daemon=True)
+        self.thread.start()
+
+    def health(self):
+        if self.error is not None:
+            raise RuntimeError(f'Camera recording failed: {self.error}') from self.error
+
+    def enqueue(self, key, rgb, metadata):
+        self.health()
+        if self.closing.is_set():
+            raise RuntimeError('Camera recorder is closing')
+        with self.lock:
+            self.counts[key]['received'] += 1
+            self.counts[key]['missing_frame_numbers'] += metadata['missing_before']
+        try:
+            self.queue.put_nowait((key, rgb, metadata))
+        except queue.Full:
+            self.error = RuntimeError('Recording queue is full; disk/PNG writer cannot keep up. '
+                                      'Recording is incomplete; stopping rollout.')
+            self.health()
+
+    def _write(self):
+        try:
+            with contextlib.ExitStack() as stack:
+                logs = {key: stack.enter_context(
+                    (self.directory / key / 'frames.jsonl').open('w', buffering=1))
+                    for key in self.keys}
+                while not self.closing.is_set() or not self.queue.empty():
+                    try:
+                        key, rgb, metadata = self.queue.get(timeout=0.05)
+                    except queue.Empty:
+                        continue
+                    filename = metadata['file']
+                    bgr = self.cv2.cvtColor(rgb, self.cv2.COLOR_RGB2BGR)
+                    if not self.cv2.imwrite(str(self.directory / key / filename), bgr,
+                                           [self.cv2.IMWRITE_PNG_COMPRESSION,
+                                            self.args.recording_png_compression]):
+                        raise OSError(f'Failed to write {key}/{filename}')
+                    logs[key].write(json.dumps(metadata, allow_nan=False) + '\n')
+                    with self.lock:
+                        self.counts[key]['saved'] += 1
+        except Exception as exc:
+            self.error = exc
+
+    def close(self):
+        # Called after acquisition threads stop, so the queue cannot grow.
+        with self.close_lock:
+            if self.closed:
+                self.health()
+                return
+            self.closing.set()
+            self.thread.join(timeout=self.args.recording_flush_timeout_s)
+            if self.thread.is_alive():
+                raise TimeoutError('Camera recording flush timed out; files are not fully saved')
+            with self.lock:
+                counts = copy.deepcopy(self.counts)
+            complete = self.error is None and all(
+                value['received'] == value['saved'] and value['missing_frame_numbers'] == 0
+                for value in counts.values())
+            summary = dict(complete=complete, cameras=counts,
+                           error=None if self.error is None else str(self.error))
+            (self.directory / 'summary.json').write_text(json.dumps(summary, indent=2))
+            while not self.queue.empty():
+                self.queue.get_nowait()  # Release buffered images after a writer failure.
+            self.closed = True
+            print(json.dumps(dict(event='camera_recording_closed', **summary)), flush=True)
+            self.health()
+
+
 class Cameras:
-    def __init__(self, args):
+    def __init__(self, args, record_dir=None):
         import pyrealsense2 as rs
         self.args, self.pipelines = args, {}
-        self.last_numbers = {}
+        self.started = set()
+        self.stop = threading.Event()
+        self.condition = threading.Condition()
+        self.close_lock = threading.Lock()
+        self.latest, self.threads, self.counts = {}, [], {}
+        self.error = None
+        self.closed = False
+        self.recorder = FrameRecorder(record_dir, args) if record_dir is not None else None
         try:
             for key, serial in [('cam_high', args.head_serial),
                                 ('cam_left_wrist', args.wrist_serial)]:
@@ -222,29 +315,126 @@ class Cameras:
                 config.enable_device(serial)
                 config.enable_stream(rs.stream.color, args.camera_width, args.camera_height,
                                      rs.format.rgb8, args.camera_fps)
-                pipeline.start(config)
                 self.pipelines[key] = pipeline
-            for _ in range(args.camera_warmup_frames):
-                self.read()
-        except BaseException:
-            self.close()
+                pipeline.start(config)
+                self.started.add(key)
+                thread = threading.Thread(target=self._capture, args=(key, serial, pipeline),
+                                          name=f'capture-{key}', daemon=True)
+                self.threads.append(thread)
+                thread.start()
+            deadline = (time.monotonic() + args.camera_timeout_ms / 1000
+                        + 2 * args.camera_warmup_frames / args.camera_fps)
+            with self.condition:
+                while any(self.counts.get(key, 0) < args.camera_warmup_frames
+                          for key in self.pipelines):
+                    self.health()
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError('Camera warmup timed out')
+                    self.condition.wait(min(0.05, remaining))
+        except BaseException as exc:
+            if self.recorder is not None and self.recorder.error is None:
+                self.recorder.error = exc
+            try:
+                self.close()
+            except Exception as cleanup_error:
+                raise exc from cleanup_error
             raise
 
-    def read(self):
-        images = {}
-        for key, pipeline in self.pipelines.items():
-            frame = pipeline.wait_for_frames(self.args.camera_timeout_ms).get_color_frame()
-            if not frame or frame.get_frame_number() == self.last_numbers.get(key):
-                raise RuntimeError(f'Missing/stale RGB frame: {key}')
-            self.last_numbers[key] = frame.get_frame_number()
-            images[key] = np.asanyarray(frame.get_data()).copy()
-        return images
+    def _capture(self, key, serial, pipeline):
+        previous, sequence = None, 0
+        try:
+            while not self.stop.is_set():
+                frame = pipeline.wait_for_frames(self.args.camera_timeout_ms).get_color_frame()
+                if self.stop.is_set():
+                    break
+                if not frame:
+                    raise RuntimeError(f'Missing RGB frame: {key}')
+                number = frame.get_frame_number()
+                if number == previous:
+                    continue  # Never record the same SDK frame twice.
+                if previous is not None and number < previous:
+                    raise RuntimeError(f'Camera frame counter went backwards: {key}')
+                missing = 0 if previous is None else number - previous - 1
+                rgb = np.asanyarray(frame.get_data()).copy()
+                metadata = dict(sequence=sequence, frame_number=number, serial=serial,
+                                device_timestamp_ms=frame.get_timestamp(),
+                                timestamp_domain=str(frame.get_frame_timestamp_domain()),
+                                host_monotonic_ns=time.monotonic_ns(),
+                                host_time_ns=time.time_ns(), missing_before=missing,
+                                file=f'{sequence:08d}.png')
+                if self.recorder is not None:
+                    self.recorder.enqueue(key, rgb, metadata)
+                if missing:
+                    print(json.dumps(dict(event='camera_frame_gap', camera=key,
+                                          frame_number=number, missing=missing)), flush=True)
+                with self.condition:
+                    self.latest[key] = (rgb, metadata)
+                    self.counts[key] = sequence + 1
+                    self.condition.notify_all()
+                previous, sequence = number, sequence + 1
+        except Exception as exc:
+            if not self.stop.is_set():
+                self.error = exc
+                if self.recorder is not None and self.recorder.error is None:
+                    self.recorder.error = exc
+                self.stop.set()
+                with self.condition:
+                    self.condition.notify_all()
+
+    def health(self):
+        if self.error is not None:
+            raise RuntimeError(f'Camera acquisition failed: {self.error}') from self.error
+        if self.recorder is not None:
+            self.recorder.health()
+
+    def read(self, with_metadata=False):
+        self.health()
+        with self.condition:
+            if self.stop.is_set():
+                raise RuntimeError('Cameras have been closed')
+            images, frames = {}, {}
+            for key in self.pipelines:
+                if key not in self.latest:
+                    raise RuntimeError(f'No camera frame: {key}')
+                rgb, metadata = self.latest[key]
+                age = (time.monotonic_ns() - metadata['host_monotonic_ns']) / 1e9
+                if age > self.args.camera_timeout_ms / 1000:
+                    raise TimeoutError(f'Stale camera frame: {key}, age={age:.3f}s')
+                images[key], frames[key] = rgb.copy(), metadata.copy()
+        return (images, frames) if with_metadata else images
 
     def close(self):
-        for pipeline in self.pipelines.values():
-            with contextlib.suppress(Exception):
-                pipeline.stop()
-        self.pipelines.clear()
+        with self.close_lock:
+            if self.closed:
+                return
+            self.stop.set()
+            errors = []
+            for key, pipeline in list(self.pipelines.items()):
+                try:
+                    pipeline.stop()  # Unblocks pending wait_for_frames.
+                except Exception as exc:
+                    if key in self.started:
+                        errors.append(f'{key}: {exc}')
+                    else:
+                        del self.pipelines[key]  # Failed start: release native reference.
+                else:
+                    self.started.discard(key)
+                    del self.pipelines[key]
+            for thread in self.threads:
+                thread.join(timeout=self.args.camera_timeout_ms / 1000 + 1)
+            if any(thread.is_alive() for thread in self.threads):
+                errors.append('Camera acquisition thread did not stop')
+            else:
+                self.latest.clear()
+                if self.recorder is not None:
+                    try:
+                        self.recorder.close()
+                    except Exception as exc:
+                        errors.append(str(exc))
+            if errors:
+                raise RuntimeError('Camera cleanup failed: ' + '; '.join(errors))
+            self.closed = True
 
 
 class RobotControl:
@@ -459,29 +649,34 @@ def run(args):
             print(f'{args.mode} passed; no robot or camera opened.', flush=True)
             return
 
-        cameras = Cameras(args)
+        cameras = Cameras(args, log_dir if args.save_observations else None)
         stack.callback(cameras.close)
         robot = RobotControl(args, mapping)
         stack.callback(robot.close)
         robot.ready.wait(args.feedback_timeout_s + 1)
         measured, previous = robot.snapshot()
+        def health():
+            robot.health()
+            cameras.health()
         steps, chunk = 0, 0
         while steps < args.max_steps:
-            obs = cameras.read()
+            obs, camera_frames = cameras.read(with_metadata=True)
             measured, previous = robot.snapshot()
             state = previous if args.state_source == 'previous-target' else measured
             obs['qpos'] = state.astype(np.float32)
             if args.save_observations:
                 np.savez(log_dir / f'observation_{chunk:05d}.npz', **obs)
-            result = policy.predict(obs, robot.health)
+            result = policy.predict(obs, health)
             actions = np.asarray(result['actions'], dtype=np.float64)
             if actions.shape != (50, 7) or not np.isfinite(actions).all():
                 raise ValueError('Policy IPC returned invalid actions')
             log.write(json.dumps(dict(event='prediction', chunk=chunk, state=state.tolist(),
-                                      measured=measured.tolist(), **result), allow_nan=False) + '\n')
+                                      measured=measured.tolist(), camera_frames=camera_frames,
+                                      **result), allow_nan=False) + '\n')
             count = min(args.execute_steps, args.max_steps - steps)
             if args.mode == 'rollout':
                 for action in actions[:count]:
+                    health()
                     measured, command = robot.send(action)
                     log.write(json.dumps(dict(event='command', step=steps,
                                               requested=action.tolist(), sent=command.tolist(),
@@ -505,22 +700,29 @@ def parse_args():
         parser.add_argument('--' + name, required=True)
     for name in ('seed', 'denoise-steps', 'camera-width', 'camera-height', 'camera-fps',
                  'camera-timeout-ms', 'camera-warmup-frames', 'execute-steps', 'max-steps',
-                 'smoke-chunks', 'motor-timeout-ms', 'save-observations'):
+                 'smoke-chunks', 'motor-timeout-ms', 'save-observations', 'recording-queue-size',
+                 'recording-png-compression'):
         parser.add_argument('--' + name, required=True, type=int)
     for name in ('control-hz', 'policy-timeout-s', 'load-timeout-s', 'feedback-timeout-s',
                  'command-velocity', 'max-joint-step', 'max-target-jump', 'max-tracking-error',
-                 'gripper-closed', 'gripper-open', 'gripper-velocity', 'gripper-torque', 'max-gripper-step'):
+                 'gripper-closed', 'gripper-open', 'gripper-velocity', 'gripper-torque', 'max-gripper-step',
+                 'recording-flush-timeout-s'):
         parser.add_argument('--' + name, required=True, type=float)
     for name in ('max-torque', 'joint-signs', 'joint-offsets'):
         parser.add_argument('--' + name, required=True, type=float, nargs=6)
     args = parser.parse_args()
-    exceptions = {'seed', 'save_observations', 'gripper_closed', 'gripper_open'}
+    exceptions = {'seed', 'save_observations', 'gripper_closed', 'gripper_open',
+                  'recording_png_compression'}
     for key, value in vars(args).items():
         if isinstance(value, (int, float)) and key not in exceptions:
             if not np.isfinite(value) or value <= 0:
                 parser.error(f'{key} must be positive and finite')
     if not 1 <= args.execute_steps <= 50:
         parser.error('execute-steps must be in [1, 50]')
+    if args.save_observations not in (0, 1):
+        parser.error('save-observations must be 0 or 1')
+    if not 0 <= args.recording_png_compression <= 9:
+        parser.error('recording-png-compression must be in [0, 9]')
     if not 0 < args.motor_timeout_ms <= 32760:
         parser.error('motor-timeout-ms must be in [1, 32760]')
     if args.motor_timeout_ms <= 2000 / args.control_hz:

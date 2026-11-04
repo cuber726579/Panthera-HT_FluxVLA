@@ -732,7 +732,12 @@ class PadStatesAndActions:
                  model_action_dim: int,
                  state_key: str = 'states',
                  action_key: str = 'actions',
-                 pad_value: float = 0.0):
+                 pad_value: float = 0.0,
+                 *args,
+                 **kwargs):
+        # ``*args``/``**kwargs`` keep this transform compatible with the
+        # ``model_path`` key that PrivateInferenceDataset injects into every
+        # inference-time transform config.
         self.model_action_dim = int(model_action_dim)
         self.state_key = state_key
         self.action_key = action_key

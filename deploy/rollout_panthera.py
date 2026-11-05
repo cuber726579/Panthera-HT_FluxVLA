@@ -106,18 +106,23 @@ class Policy:
                          checkpoint=args.checkpoint, tensor_count=tensor_count,
                          param_dtype=args.param_dtype, loaded=False)
         if load_model:
+            from accelerate import init_empty_weights
             from safetensors.torch import load_file
             from fluxvla.engines import build_vla_from_cfg
             model_cfg = copy.deepcopy(cfg.inference_model)
             model_cfg.update(pretrained_name_or_path=None, num_steps=args.denoise_steps)
-            self.model = build_vla_from_cfg(model_cfg)
+            # Skip allocating/initializing weights that the checkpoint replaces.
+            # Keep non-persistent buffers (e.g. RoPE frequencies) materialized.
+            with init_empty_weights(include_buffers=False):
+                self.model = build_vla_from_cfg(model_cfg)
             # assign preserves the checkpoint's mixed FP32/BF16 tensors.
             # Calling .bfloat16() globally would break OpenPI FP32 flow layers.
-            weights = load_file(args.checkpoint, device='cpu')
+            weights = load_file(args.checkpoint, device='cuda:0')
             self.model.load_state_dict(weights, strict=True, assign=True)
             del weights
             if args.param_dtype == 'fp32':
                 self.model.float()
+            # Parameters are already on CUDA; move the remaining CPU buffers.
             self.model.eval().requires_grad_(False).cuda()
             self.info['loaded'] = True
             self.info['parameters'] = sum(p.numel() for p in self.model.parameters())

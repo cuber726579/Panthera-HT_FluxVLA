@@ -34,6 +34,10 @@ POLICY_TIMEOUT_S=30
 LOAD_TIMEOUT_S=180
 FEEDBACK_TIMEOUT_S=0.5
 MOTOR_TIMEOUT_MS=500               # 控制线程消失后由电机超时进入阻尼
+RETURN_TO_ZERO_ON_EXIT=1           # rollout 退出时回到 SDK 六关节零位；控制故障时跳过
+RETURN_ZERO_VELOCITY=0.3           # 回零速度上限 rad/s，同时受原控制速度/步长上限约束
+RETURN_ZERO_TIMEOUT_S=45           # 回零全过程超时，包含到位等待
+RETURN_ZERO_TOLERANCE=0.03         # 六关节实测到位容差 rad
 COMMAND_VELOCITY=0.3               # SDK 速度上限 rad/s
 MAX_JOINT_STEP=0.04                # 同时受 COMMAND_VELOCITY/CONTROL_HZ 限制
 MAX_TARGET_JUMP=0.75               # 单条目标距上一命令过大则终止 rad
@@ -57,8 +61,9 @@ RECORDING_FLUSH_TIMEOUT_S=30        # 退出时停止采集，再等待已接收
 # dry-run: 打开两路相机和 SDK，读反馈并预测，不下发策略目标。
 # rollout: 控制线程持续保持上一目标；每次执行 EXECUTE_STEPS 后重新观测。
 # dry-run/rollout 都要求 SDK 串口空闲，不可与遥操作或机械臂后台服务共用。
-# Ctrl+C/异常退出时 rollout 调用 SDK set_stop；SDK 析构还会执行 YAML 的
-# exit_motor_brake_flag 行为。退出不等于保持承重姿态，也不会自动回零。
+# rollout 正常结束、Ctrl+C 或上层异常退出时先回零，再调用 SDK set_stop。
+# 回零保持夹爪目标，再次 Ctrl+C 取消；电机/反馈/跟踪故障时直接停止，不回零。
+# SDK 析构还会执行 YAML 的 exit_motor_brake_flag 行为。
 # 本地数据来自仿真；相机摆位、关节符号/零位、夹爪行程需按实机对齐。
 
 export CUDA_VISIBLE_DEVICES="$CUDA_DEVICE"
@@ -81,6 +86,10 @@ exec "$CONDA_ROOT/envs/$ROBOT_ENV/bin/python" "$ROOT/deploy/rollout_panthera.py"
   --max-steps "$MAX_STEPS" --smoke-chunks "$SMOKE_CHUNKS" \
   --policy-timeout-s "$POLICY_TIMEOUT_S" --load-timeout-s "$LOAD_TIMEOUT_S" \
   --feedback-timeout-s "$FEEDBACK_TIMEOUT_S" --motor-timeout-ms "$MOTOR_TIMEOUT_MS" \
+  --return-to-zero-on-exit "$RETURN_TO_ZERO_ON_EXIT" \
+  --return-zero-velocity "$RETURN_ZERO_VELOCITY" \
+  --return-zero-timeout-s "$RETURN_ZERO_TIMEOUT_S" \
+  --return-zero-tolerance "$RETURN_ZERO_TOLERANCE" \
   --command-velocity "$COMMAND_VELOCITY" --max-joint-step "$MAX_JOINT_STEP" \
   --max-target-jump "$MAX_TARGET_JUMP" --max-tracking-error "$MAX_TRACKING_ERROR" \
   --max-torque "${MAX_TORQUE[@]}" --joint-signs "${JOINT_SIGNS[@]}" \

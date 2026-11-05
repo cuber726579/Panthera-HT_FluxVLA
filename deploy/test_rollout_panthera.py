@@ -2,6 +2,7 @@
 
 Run: conda run -n panthera python -m unittest discover -s deploy -p 'test_*.py'
 """
+import contextlib
 import queue
 import json
 from pathlib import Path
@@ -17,7 +18,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 
 from rollout_panthera import (Cameras, FrameRecorder, H264VideoWriter, JointMapping,
-                             RobotControl, guard_target, run)
+                             RobotControl, guard_target, register_cleanup, run)
 
 
 def arguments():
@@ -27,6 +28,8 @@ def arguments():
                            max_joint_step=.04, command_velocity=.3, control_hz=30,
                            max_target_jump=.75, max_tracking_error=.35,
                            max_gripper_step=.05, feedback_timeout_s=.05, motor_timeout_ms=500,
+                           return_to_zero_on_exit=0, return_zero_velocity=.3,
+                           return_zero_timeout_s=45., return_zero_tolerance=.03,
                            mode='dry-run')
 
 
@@ -84,6 +87,8 @@ class FeedbackAndThread(unittest.TestCase):
         controller.robot.get_current_state_gripper.return_value = states[6]
         controller.last_stamps = np.zeros(7)
         controller.last_updates = np.full(7, time.monotonic())
+        controller.home_abort, controller.control_done = threading.Event(), threading.Event()
+        controller.return_error = None
         return controller, states
 
     def test_stale_feedback_is_detected_per_motor(self):
@@ -106,6 +111,8 @@ class FeedbackAndThread(unittest.TestCase):
 
     def test_dry_run_never_sends_policy_targets(self):
         controller, _ = self.controller()
+        controller.args.return_to_zero_on_exit = 1
+        controller._return_to_zero = Mock()
         controller.stop_event, controller.ready = threading.Event(), threading.Event()
         controller.lock = threading.Lock()
         controller.last_target, controller.error = None, None
@@ -118,6 +125,7 @@ class FeedbackAndThread(unittest.TestCase):
         controller.robot.gripper_control.assert_not_called()
         controller.robot.set_timeout.assert_not_called()
         controller.robot.set_stop.assert_not_called()
+        controller._return_to_zero.assert_not_called()
 
     def test_control_failure_stops_robot(self):
         controller, states = self.controller()
@@ -165,6 +173,129 @@ class FeedbackAndThread(unittest.TestCase):
             np.testing.assert_allclose(call.args[1], speed, atol=1e-12)
         self.assertTrue(all(event.is_set() for event in acknowledgements))
         controller.robot.set_stop.assert_called_once()
+
+
+class ReturnToZero(unittest.TestCase):
+    controller = FeedbackAndThread.controller
+
+    def prepared(self):
+        controller, _ = self.controller()
+        controller.args.mode = 'rollout'
+        controller.args.return_to_zero_on_exit = 1
+        controller.args.max_torque = [21, 36, 36, 21, 10, 10]
+        controller.args.gripper_torque = .5
+        controller.stop_event, controller.ready = threading.Event(), threading.Event()
+        controller.lock = threading.Lock()
+        controller.last_target = np.array([.1, -.1, .05, 0., 0., 0., .8])
+        controller.error = None
+        controller.thread = Mock()
+        controller.thread.is_alive.return_value = False
+        controller.feedback = Mock(side_effect=lambda: controller.last_target.copy())
+        # A deterministic SDK stand-in: deployment must use the SDK interpolator.
+        def interpolate(start, end, duration, elapsed):
+            fraction = min(elapsed / duration, 1.)
+            return (start + fraction * (end - start),
+                    (end - start) / duration if fraction < 1 else np.zeros(6),
+                    np.zeros(6))
+        controller.robot.septic_interpolation.side_effect = interpolate
+        return controller
+
+    def run_homing(self, controller, cancel=False):
+        now = [0.]
+        def advance(seconds):
+            now[0] += max(seconds, .001)
+            if cancel:
+                controller.home_abort.set()
+        with patch('rollout_panthera.time.monotonic', side_effect=lambda: now[0]), \
+                patch.object(controller.home_abort, 'wait', side_effect=advance):
+            controller._return_to_zero()
+
+    def test_homing_checks_measured_arrival_and_keeps_gripper(self):
+        controller = self.prepared()
+        self.run_homing(controller)
+        calls = controller.robot.Joint_Pos_Vel.call_args_list
+        self.assertGreater(len(calls), 90)
+        np.testing.assert_allclose(calls[-1].args[0], np.zeros(6))
+        self.assertLess(calls[1].args[1][0], 0.)
+        self.assertGreater(calls[1].args[1][1], 0.)
+        for call in calls:
+            self.assertLessEqual(np.max(np.abs(call.args[1])), .3)
+        for call in controller.robot.gripper_control.call_args_list:
+            self.assertEqual(call.args, (.8, 0., .5))
+        controller.robot.septic_interpolation.assert_called()
+
+    def test_homing_timeout_does_not_claim_arrival_from_command_alone(self):
+        controller = self.prepared()
+        controller.args.return_zero_timeout_s = 4.
+        controller.feedback.side_effect = None
+        controller.feedback.return_value = controller.last_target.copy()
+        with self.assertRaisesRegex(TimeoutError, 'measured joints settled'):
+            self.run_homing(controller)
+
+    def test_homing_can_be_cancelled(self):
+        controller = self.prepared()
+        with self.assertRaisesRegex(RuntimeError, 'cancelled'):
+            self.run_homing(controller, cancel=True)
+        self.assertEqual(controller.robot.Joint_Pos_Vel.call_count, 1)
+
+    def test_homing_rejects_invalid_zero_feedback_and_tracking(self):
+        for failure in ('limits', 'feedback', 'tracking'):
+            with self.subTest(failure=failure):
+                controller = self.prepared()
+                if failure == 'limits':
+                    controller.robot.joint_limits['lower'][0] = .01
+                elif failure == 'feedback':
+                    controller.feedback.side_effect = TimeoutError('Motor feedback stopped updating')
+                else:
+                    measured = controller.last_target.copy()
+                    measured[0] += .4
+                    controller.feedback.side_effect = None
+                    controller.feedback.return_value = measured
+                with self.assertRaises((ValueError, TimeoutError)):
+                    self.run_homing(controller)
+                controller.robot.Joint_Pos_Vel.assert_not_called()
+
+    def test_exit_returns_before_stop_and_faulted_control_skips_home(self):
+        for faulted in (False, True):
+            with self.subTest(faulted=faulted):
+                controller = self.prepared()
+                controller.stop_event.set()
+                if faulted:
+                    controller.error = RuntimeError('motor fault')
+                home = Mock()
+                controller.robot.attach_mock(home, 'home')
+                controller._return_to_zero = home
+                controller._run()
+                if faulted:
+                    home.assert_not_called()
+                else:
+                    home.assert_called_once()
+                    self.assertLess(controller.robot.mock_calls.index(unittest.mock.call.home()),
+                                    controller.robot.mock_calls.index(unittest.mock.call.set_stop()))
+                controller.robot.set_stop.assert_called_once()
+                self.assertTrue(controller.control_done.is_set())
+
+    def test_return_failure_still_stops_and_close_reports_failure(self):
+        controller = self.prepared()
+        controller.stop_event.set()
+        controller._return_to_zero = Mock(side_effect=TimeoutError('home timeout'))
+        controller._run()
+        controller.robot.set_stop.assert_called_once()
+        self.assertTrue(controller.control_done.is_set())
+        with self.assertRaisesRegex(RuntimeError, 'home timeout'):
+            controller.close()
+        self.assertIsNone(controller.robot)
+
+    def test_interrupt_during_close_aborts_home(self):
+        controller = self.prepared()
+        def interrupted_wait(_):
+            controller.control_done.set()
+            raise KeyboardInterrupt()
+        with patch.object(controller.control_done, 'wait', side_effect=interrupted_wait):
+            with self.assertRaises(KeyboardInterrupt):
+                controller.close()
+        self.assertTrue(controller.home_abort.is_set())
+        self.assertIsNone(controller.robot)
 
 
 def camera_args(**overrides):
@@ -459,6 +590,40 @@ class CameraRecording(unittest.TestCase):
                         self.assertEqual(rows[meta['video_frame_index']], meta)
                         with np.load(folder / 'observation/00000.npz') as data:
                             np.testing.assert_array_equal(data[key], FakeFrame(meta['frame_number']).get_data())
+
+
+class ExitCleanup(unittest.TestCase):
+    def test_camera_cleanup_failure_preserves_interrupt_or_original_error(self):
+        for original in (KeyboardInterrupt('Ctrl+C'), RuntimeError('inference failed')):
+            with self.subTest(original=type(original).__name__), tempfile.TemporaryDirectory() as directory:
+                policy, camera, robot = Mock(), Mock(), Mock()
+                events = []
+                robot.close.side_effect = lambda: events.append('home_and_stop')
+                def close_camera():
+                    events.append('camera_close')
+                    raise RuntimeError('Camera frame counter went backwards: cam_left_wrist')
+                camera.close.side_effect = close_camera
+                policy.close.side_effect = lambda: events.append('policy_close')
+                with self.assertRaises(type(original)) as caught:
+                    with contextlib.ExitStack() as stack:
+                        for resource, name in ((policy, 'policy'), (camera, 'cameras'), (robot, 'robot')):
+                            register_cleanup(stack, resource, name, directory)
+                        raise original
+                self.assertIs(caught.exception, original)
+                self.assertEqual(events, ['home_and_stop', 'camera_close', 'policy_close'])
+                event = json.loads((Path(directory) / 'cleanup_errors.jsonl').read_text())
+                self.assertEqual(event['resource'], 'cameras')
+                self.assertEqual(event['original_exit_type'], type(original).__name__)
+
+    def test_cleanup_failure_on_normal_exit_remains_fatal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            camera = Mock()
+            camera.close.side_effect = RuntimeError('disk write failed')
+            with self.assertRaisesRegex(RuntimeError, 'disk write failed'):
+                with contextlib.ExitStack() as stack:
+                    register_cleanup(stack, camera, 'cameras', directory)
+            event = json.loads((Path(directory) / 'cleanup_errors.jsonl').read_text())
+            self.assertIsNone(event['original_exit_type'])
 
 
 if __name__ == '__main__':

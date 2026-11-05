@@ -545,6 +545,8 @@ class RobotControl:
         self.args, self.mapping = args, mapping
         self.robot = Panthera(args.robot_config)
         self.stop_event, self.ready = threading.Event(), threading.Event()
+        self.home_abort, self.control_done = threading.Event(), threading.Event()
+        self.return_error = None
         self.lock, self.commands = threading.Lock(), queue.Queue(maxsize=1)
         self.error = None
         self.measured = self.last_target = None
@@ -630,9 +632,92 @@ class RobotControl:
             self.error = exc
             self.ready.set()
         finally:
-            if active:
-                with contextlib.suppress(Exception):
-                    self.robot.set_stop()
+            try:
+                if active:
+                    try:
+                        if self.args.return_to_zero_on_exit and self.error is None:
+                            self._return_to_zero()
+                        elif self.args.return_to_zero_on_exit:
+                            print(f'Return to zero skipped: control failed: {self.error}', flush=True)
+                    except Exception as exc:
+                        self.return_error = exc
+                        print(f'Return to zero failed: {exc}', file=sys.stderr, flush=True)
+                    finally:
+                        try:
+                            self.robot.set_stop()
+                        except Exception as exc:
+                            self.return_error = self.return_error or exc
+                            print(f'SDK stop failed: {exc}', file=sys.stderr, flush=True)
+            finally:
+                self.control_done.set()
+
+    def _return_to_zero(self):
+        """Return six SDK joint coordinates to zero; keep the gripper target.
+
+        Use the SDK's septic_interpolation, with all SDK access still owned by
+        this thread. Refresh commands/feedback throughout the motor watchdog
+        interval, and stop on faults, stale feedback, tracking error or timeout.
+        """
+        args = self.args
+        if self.home_abort.is_set():
+            raise RuntimeError('Return to zero cancelled')
+        measured = self.feedback()
+        if measured is None:
+            raise RuntimeError('Return to zero requires initialized feedback')
+        lower, upper = self.robot.joint_limits['lower'], self.robot.joint_limits['upper']
+        if np.any(np.asarray(lower) > 0) or np.any(np.asarray(upper) < 0):
+            raise ValueError('SDK zero pose is outside joint limits')
+        start = measured[:6].copy()
+        previous = start.copy()
+        gripper = measured[6] if self.last_target is None else self.last_target[6]
+        if self.last_target is not None and np.max(np.abs(self.last_target[:6] - start)) > args.max_tracking_error:
+            raise ValueError('Return to zero refused: existing tracking error')
+        speed = min(args.return_zero_velocity, args.command_velocity,
+                    args.max_joint_step * args.control_hz)
+        # Peak derivative of the SDK's seventh-order smoothstep is 2.1875.
+        duration = max(3.0, 2.1875 * np.max(np.abs(start)) / speed)
+        if duration + 0.5 >= args.return_zero_timeout_s:
+            raise ValueError('Return-to-zero timeout is too short for the bounded trajectory')
+        print(f'Returning six SDK joints to zero: duration={duration:.2f}s, '
+              f'velocity<={speed:.3f}rad/s; keeping gripper target. '
+              'Press Ctrl+C again to cancel.', flush=True)
+        began = last_tick = time.monotonic()
+        progress, settled_since = 0.0, None
+        while True:
+            tick = time.monotonic()
+            if self.home_abort.is_set():
+                raise RuntimeError('Return to zero cancelled')
+            if tick - began >= args.return_zero_timeout_s:
+                raise TimeoutError('Return to zero timed out before measured joints settled')
+            measured = self.feedback()
+            if measured is None:
+                raise RuntimeError('Return to zero lost initialized feedback')
+            if np.any(measured[:6] < lower) or np.any(measured[:6] > upper):
+                raise ValueError('Return to zero: measured joints outside SDK limits')
+            # Do not catch up with a large position jump after a delayed tick.
+            progress = min(duration, progress + min(max(tick - last_tick, 0), 1 / args.control_hz))
+            last_tick = tick
+            target, velocity, _ = self.robot.septic_interpolation(
+                start, np.zeros(6), duration, progress)
+            if max(np.max(np.abs(previous - measured[:6])),
+                   np.max(np.abs(target - measured[:6]))) > args.max_tracking_error:
+                raise ValueError('Return to zero: tracking error exceeds configured limit')
+            if self.home_abort.is_set():
+                raise RuntimeError('Return to zero cancelled')
+            if not self.robot.Joint_Pos_Vel(target, np.clip(velocity, -speed, speed),
+                                           args.max_torque, iswait=False):
+                raise RuntimeError('SDK rejected return-to-zero joint command')
+            if not self.robot.gripper_control(gripper, 0.0, args.gripper_torque):
+                raise RuntimeError('SDK rejected return-to-zero gripper hold')
+            previous = target.copy()
+            with self.lock:
+                self.measured, self.last_target = measured, np.r_[target, gripper]
+            reached = progress >= duration and np.max(np.abs(measured[:6])) <= args.return_zero_tolerance
+            settled_since = (tick if settled_since is None else settled_since) if reached else None
+            if settled_since is not None and tick - settled_since >= 0.2:
+                print(f'Return to zero complete; measured joints={measured[:6].tolist()}', flush=True)
+                return
+            self.home_abort.wait(max(0, 1 / args.control_hz - (time.monotonic() - tick)))
 
     def snapshot(self):
         self.health()
@@ -652,12 +737,31 @@ class RobotControl:
         return self.snapshot()
 
     def close(self):
+        if self.robot is None:
+            return
         self.stop_event.set()
+        deadline = time.monotonic() + self.args.return_zero_timeout_s + 2
+        interrupted = False
+        while not self.control_done.is_set():
+            try:
+                if time.monotonic() >= deadline:
+                    self.home_abort.set()
+                    raise RuntimeError('SDK cleanup did not finish; motor watchdog remains active')
+                self.control_done.wait(0.05)
+            except KeyboardInterrupt:
+                interrupted = True
+                self.home_abort.set()
+                deadline = min(deadline, time.monotonic() + 2)
+                print('Cancelling return to zero; stopping robot.', flush=True)
         self.thread.join(timeout=2)
         if self.thread.is_alive():
             raise RuntimeError('SDK thread did not stop; motor watchdog remains active')
         # The SDK destructor also applies its configured brake/stop policy.
         self.robot = None
+        if interrupted:
+            raise KeyboardInterrupt('Return to zero cancelled')
+        if self.return_error is not None:
+            raise RuntimeError(f'Robot exit cleanup failed: {self.return_error}') from self.return_error
 
 
 def sdk_serial_ports(motor_config):
@@ -727,6 +831,35 @@ def preflight(args):
     return JointMapping(args)
 
 
+def register_cleanup(stack, resource, name, log_dir):
+    """Close every resource without replacing the original exception on exit.
+
+    Cleanup failures remain fatal on an otherwise successful run. If an error
+    or Ctrl+C is already unwinding the stack, retain it and report secondary
+    failures in stderr and cleanup_errors.jsonl (recording summary stays false).
+    """
+    def close(exc_type, exc, traceback):
+        try:
+            resource.close()
+        except Exception as cleanup_error:
+            event = dict(resource=name, error_type=type(cleanup_error).__name__,
+                         error=str(cleanup_error), host_time_ns=time.time_ns(),
+                         original_exit_type=None if exc_type is None else exc_type.__name__,
+                         original_exit=None if exc is None else str(exc))
+            try:
+                with (Path(log_dir) / 'cleanup_errors.jsonl').open('a') as output:
+                    output.write(json.dumps(event, ensure_ascii=False) + '\n')
+            except Exception as log_error:
+                print(f'Could not save cleanup error: {log_error}', file=sys.stderr, flush=True)
+            print(f'Cleanup failed [{name}]: {cleanup_error}'
+                  + (f'; preserving original {exc_type.__name__}.' if exc_type is not None else ''),
+                  file=sys.stderr, flush=True)
+            if exc_type is None:
+                raise
+        return False
+    stack.push(close)
+
+
 def run(args):
     mapping = preflight(args)
     stamp = time.strftime('%Y%m%d_%H%M%S')
@@ -736,7 +869,7 @@ def run(args):
     print(f'Mode={args.mode}; robot Python={sys.executable}; logs={log_dir}', flush=True)
     with tempfile.TemporaryDirectory(prefix='panthera-policy-') as temp, contextlib.ExitStack() as stack:
         policy = PolicyProcess(args, temp)
-        stack.callback(policy.close)
+        register_cleanup(stack, policy, 'policy', log_dir)
         ready = policy.receive(args.load_timeout_s)
         print(json.dumps(ready, ensure_ascii=False), flush=True)
         (log_dir / 'policy.json').write_text(json.dumps(ready, indent=2))
@@ -759,9 +892,9 @@ def run(args):
         if args.save_observations:
             observation_dir.mkdir()
         cameras = Cameras(args, log_dir if args.save_observations else None)
-        stack.callback(cameras.close)
+        register_cleanup(stack, cameras, 'cameras', log_dir)
         robot = RobotControl(args, mapping)
-        stack.callback(robot.close)
+        register_cleanup(stack, robot, 'robot', log_dir)
         robot.ready.wait(args.feedback_timeout_s + 1)
         measured, previous = robot.snapshot()
         def health():
@@ -804,6 +937,10 @@ def parse_args():
     parser.add_argument('--mode', choices=['check', 'smoke', 'dry-run', 'rollout'], required=True)
     parser.add_argument('--param-dtype', choices=['checkpoint', 'fp32'], required=True)
     parser.add_argument('--state-source', choices=['previous-target', 'measured'], required=True)
+    parser.add_argument('--return-to-zero-on-exit', type=int, choices=[0, 1], default=1)
+    parser.add_argument('--return-zero-velocity', type=float, default=0.3)
+    parser.add_argument('--return-zero-timeout-s', type=float, default=45.0)
+    parser.add_argument('--return-zero-tolerance', type=float, default=0.03)
     for name in ('policy-python', 'sdk-root', 'robot-config', 'model-config', 'checkpoint',
                  'statistics', 'tokenizer-root', 'instruction', 'head-serial', 'wrist-serial', 'log-root'):
         parser.add_argument('--' + name, required=True)
@@ -821,7 +958,7 @@ def parse_args():
         parser.add_argument('--' + name, required=True, type=float, nargs=6)
     args = parser.parse_args()
     exceptions = {'seed', 'save_observations', 'gripper_closed', 'gripper_open',
-                  'recording_video_crf'}
+                  'recording_video_crf', 'return_to_zero_on_exit'}
     for key, value in vars(args).items():
         if isinstance(value, (int, float)) and key not in exceptions:
             if not np.isfinite(value) or value <= 0:

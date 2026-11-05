@@ -47,9 +47,9 @@ GRIPPER_VELOCITY=0.5
 GRIPPER_TORQUE=0.5
 MAX_GRIPPER_STEP=0.05              # 每控制周期，模型归一化单位
 LOG_ROOT="$ROOT/deploy/runs"
-SAVE_OBSERVATIONS=1                # 1: 持续保存两路相机每帧无损 PNG/帧号/时间戳，并保留推理输入 npz
+SAVE_OBSERVATIONS=1                # 1: 保存双路 H.264 MP4、逐帧时间戳及原始推理输入 NPZ（需 ffmpeg/libx264）
 RECORDING_QUEUE_SIZE=128           # 两路共享的写盘队列帧数；满时明确报错并停止，不静默丢帧
-RECORDING_PNG_COMPRESSION=0         # 0..9 均无损；0 不压缩，优先保证双路 30 FPS 写盘速度
+RECORDING_VIDEO_CRF=23             # 0..51，越小画质越高/文件越大；视频有损，NPZ 保留原始 RGB
 RECORDING_FLUSH_TIMEOUT_S=30        # 退出时停止采集，再等待已接收帧写完；超时报告保存不完整
 
 # 使用方式：bash deploy/rollout_panthera.sh [check|smoke|dry-run|rollout]
@@ -90,5 +90,5 @@ exec "$CONDA_ROOT/envs/$ROBOT_ENV/bin/python" "$ROOT/deploy/rollout_panthera.py"
   --max-gripper-step "$MAX_GRIPPER_STEP" \
   --log-root "$LOG_ROOT" --save-observations "$SAVE_OBSERVATIONS" \
   --recording-queue-size "$RECORDING_QUEUE_SIZE" \
-  --recording-png-compression "$RECORDING_PNG_COMPRESSION" \
+  --recording-video-crf "$RECORDING_VIDEO_CRF" \
   --recording-flush-timeout-s "$RECORDING_FLUSH_TIMEOUT_S"

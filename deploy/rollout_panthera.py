@@ -210,21 +210,98 @@ class PolicyProcess:
         self.selector.close()
 
 
+class H264VideoWriter:
+    """One FFmpeg process per camera; RGB input, H.264/yuv420p MP4 output."""
+    def __init__(self, directory, args):
+        self.args = args
+        self.finalized = False
+        self.error_path = Path(directory) / 'encoder.log'
+        self.error_log = self.error_path.open('wb')
+        command = [
+            'ffmpeg', '-hide_banner', '-loglevel', 'error', '-nostdin', '-n',
+            '-f', 'rawvideo', '-pixel_format', 'rgb24',
+            '-video_size', f'{args.camera_width}x{args.camera_height}',
+            '-framerate', str(args.camera_fps), '-i', 'pipe:0', '-an',
+            '-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'zerolatency',
+            '-crf', str(args.recording_video_crf), '-pix_fmt', 'yuv420p',
+            '-threads', '2', '-filter_threads', '1', '-g', str(args.camera_fps),
+            # Fragmented MP4 avoids keeping the entire index until shutdown.
+            '-movflags', '+frag_keyframe+empty_moov+default_base_moof',
+            str(Path(directory) / 'video.mp4'),
+        ]
+        try:
+            self.proc = subprocess.Popen(command, stdin=subprocess.PIPE,
+                                         stdout=subprocess.DEVNULL, stderr=self.error_log,
+                                         bufsize=0, start_new_session=True)
+        except BaseException:
+            self.error_log.close()
+            raise
+        os.set_blocking(self.proc.stdin.fileno(), False)
+
+    def write(self, rgb):
+        data = memoryview(np.ascontiguousarray(rgb)).cast('B')
+        deadline = time.monotonic() + self.args.recording_flush_timeout_s
+        with selectors.DefaultSelector() as selector:
+            selector.register(self.proc.stdin, selectors.EVENT_WRITE)
+            while data:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError('H.264 encoder input timed out')
+                if self.proc.poll() is not None:
+                    raise RuntimeError(f'H.264 encoder exited; see {self.error_path}')
+                if not selector.select(min(remaining, .1)):
+                    continue
+                try:
+                    written = os.write(self.proc.stdin.fileno(), data)
+                except BlockingIOError:
+                    continue
+                if written == 0:
+                    raise OSError('H.264 encoder accepted zero bytes')
+                data = data[written:]
+
+    def abort(self):
+        if self.proc.poll() is None:
+            self.proc.kill()
+
+    def close(self):
+        try:
+            self.proc.stdin.close()
+            try:
+                code = self.proc.wait(timeout=self.args.recording_flush_timeout_s)
+            except subprocess.TimeoutExpired:
+                self.abort()
+                self.proc.wait(timeout=5)
+                raise TimeoutError('H.264 encoder finalization timed out')
+            if code != 0:
+                raise RuntimeError(f'H.264 encoder exited with status {code}; see {self.error_path}')
+            self.finalized = True
+        finally:
+            self.error_log.close()
+
+
 class FrameRecorder:
-    """Bounded, asynchronous lossless RGB recording, independent of inference."""
+    """Bounded H.264 recording with one timestamp row per submitted video frame."""
     keys = ('cam_high', 'cam_left_wrist')
 
     def __init__(self, directory, args):
-        import cv2
-        self.cv2, self.args = cv2, args
+        if args.camera_width % 2 or args.camera_height % 2:
+            raise ValueError('H.264 yuv420p recording requires even camera width and height')
+        if shutil.which('ffmpeg') is None:
+            raise RuntimeError('H.264 recording requires ffmpeg with the libx264 encoder')
+        encoders = subprocess.run(['ffmpeg', '-hide_banner', '-encoders'],
+                                  capture_output=True, text=True, timeout=10, check=True)
+        if 'libx264 ' not in encoders.stdout:
+            raise RuntimeError('FFmpeg does not provide the libx264 encoder')
+        self.args = args
         self.directory = Path(directory) / 'camera_frames'
         for key in self.keys:
             (self.directory / key).mkdir(parents=True, exist_ok=True)
         self.queue = queue.Queue(maxsize=args.recording_queue_size)
-        self.closing = threading.Event()
+        self.closing, self.aborted = threading.Event(), threading.Event()
         self.lock, self.close_lock = threading.Lock(), threading.Lock()
         self.error = None
         self.closed = False
+        self.writers = {}
         self.counts = {key: dict(received=0, saved=0, missing_frame_numbers=0)
                        for key in self.keys}
         self.thread = threading.Thread(target=self._write, name='camera-recorder', daemon=True)
@@ -238,13 +315,15 @@ class FrameRecorder:
         self.health()
         if self.closing.is_set():
             raise RuntimeError('Camera recorder is closing')
+        if rgb.dtype != np.uint8 or rgb.shape != (self.args.camera_height, self.args.camera_width, 3):
+            raise ValueError('Video frame must be RGB uint8 with the configured camera dimensions')
         with self.lock:
             self.counts[key]['received'] += 1
             self.counts[key]['missing_frame_numbers'] += metadata['missing_before']
         try:
-            self.queue.put_nowait((key, rgb, metadata))
+            self.queue.put_nowait((key, rgb, metadata.copy()))
         except queue.Full:
-            self.error = RuntimeError('Recording queue is full; disk/PNG writer cannot keep up. '
+            self.error = RuntimeError('Recording queue is full; disk/video encoder cannot keep up. '
                                       'Recording is incomplete; stopping rollout.')
             self.health()
 
@@ -254,22 +333,35 @@ class FrameRecorder:
                 logs = {key: stack.enter_context(
                     (self.directory / key / 'frames.jsonl').open('w', buffering=1))
                     for key in self.keys}
-                while not self.closing.is_set() or not self.queue.empty():
+                while not self.aborted.is_set() and (not self.closing.is_set() or not self.queue.empty()):
                     try:
                         key, rgb, metadata = self.queue.get(timeout=0.05)
                     except queue.Empty:
                         continue
-                    filename = metadata['file']
-                    bgr = self.cv2.cvtColor(rgb, self.cv2.COLOR_RGB2BGR)
-                    if not self.cv2.imwrite(str(self.directory / key / filename), bgr,
-                                           [self.cv2.IMWRITE_PNG_COMPRESSION,
-                                            self.args.recording_png_compression]):
-                        raise OSError(f'Failed to write {key}/{filename}')
+                    with self.lock:
+                        if self.aborted.is_set():
+                            break
+                        if key not in self.writers:
+                            self.writers[key] = H264VideoWriter(self.directory / key, self.args)
+                        writer = self.writers[key]
+                        index = self.counts[key]['saved']
+                    if metadata['video_frame_index'] != index:
+                        raise ValueError(f'Nonconsecutive video frame index for {key}: {metadata}')
+                    writer.write(rgb)
                     logs[key].write(json.dumps(metadata, allow_nan=False) + '\n')
                     with self.lock:
                         self.counts[key]['saved'] += 1
         except Exception as exc:
-            self.error = exc
+            if self.error is None:
+                self.error = exc
+        finally:
+            # Always send EOF and reap every encoder, even after a write failure.
+            for writer in self.writers.values():
+                try:
+                    writer.close()
+                except Exception as exc:
+                    if self.error is None:
+                        self.error = exc
 
     def close(self):
         # Called after acquisition threads stop, so the queue cannot grow.
@@ -280,17 +372,25 @@ class FrameRecorder:
             self.closing.set()
             self.thread.join(timeout=self.args.recording_flush_timeout_s)
             if self.thread.is_alive():
-                raise TimeoutError('Camera recording flush timed out; files are not fully saved')
+                self.error = TimeoutError('Camera recording flush timed out; video is incomplete')
+                self.aborted.set()
+                with self.lock:
+                    for writer in self.writers.values():
+                        writer.abort()  # Unblocks a full input pipe or stalled finalization.
+                self.thread.join(timeout=5)
             with self.lock:
                 counts = copy.deepcopy(self.counts)
-            complete = self.error is None and all(
+            complete = self.error is None and not self.thread.is_alive() and all(
                 value['received'] == value['saved'] and value['missing_frame_numbers'] == 0
-                for value in counts.values())
-            summary = dict(complete=complete, cameras=counts,
+                and (value['saved'] == 0 or self.writers[key].finalized)
+                for key, value in counts.items())
+            summary = dict(complete=complete, cameras=counts, codec='h264', pixel_format='yuv420p',
+                           fps=self.args.camera_fps, crf=self.args.recording_video_crf,
+                           timing='Constant FPS video; use frames.jsonl for actual capture timestamps',
                            error=None if self.error is None else str(self.error))
             (self.directory / 'summary.json').write_text(json.dumps(summary, indent=2))
             while not self.queue.empty():
-                self.queue.get_nowait()  # Release buffered images after a writer failure.
+                self.queue.get_nowait()
             self.closed = True
             print(json.dumps(dict(event='camera_recording_closed', **summary)), flush=True)
             self.health()
@@ -362,7 +462,8 @@ class Cameras:
                                 timestamp_domain=str(frame.get_frame_timestamp_domain()),
                                 host_monotonic_ns=time.monotonic_ns(),
                                 host_time_ns=time.time_ns(), missing_before=missing,
-                                file=f'{sequence:08d}.png')
+                                file='video.mp4', video_frame_index=sequence,
+                                video_timestamp_s=sequence / self.args.camera_fps)
                 if self.recorder is not None:
                     self.recorder.enqueue(key, rgb, metadata)
                 if missing:
@@ -649,6 +750,9 @@ def run(args):
             print(f'{args.mode} passed; no robot or camera opened.', flush=True)
             return
 
+        observation_dir = log_dir / 'observation'
+        if args.save_observations:
+            observation_dir.mkdir()
         cameras = Cameras(args, log_dir if args.save_observations else None)
         stack.callback(cameras.close)
         robot = RobotControl(args, mapping)
@@ -665,7 +769,7 @@ def run(args):
             state = previous if args.state_source == 'previous-target' else measured
             obs['qpos'] = state.astype(np.float32)
             if args.save_observations:
-                np.savez(log_dir / f'observation_{chunk:05d}.npz', **obs)
+                np.savez(observation_dir / f'{chunk:05d}.npz', **obs)
             result = policy.predict(obs, health)
             actions = np.asarray(result['actions'], dtype=np.float64)
             if actions.shape != (50, 7) or not np.isfinite(actions).all():
@@ -701,7 +805,7 @@ def parse_args():
     for name in ('seed', 'denoise-steps', 'camera-width', 'camera-height', 'camera-fps',
                  'camera-timeout-ms', 'camera-warmup-frames', 'execute-steps', 'max-steps',
                  'smoke-chunks', 'motor-timeout-ms', 'save-observations', 'recording-queue-size',
-                 'recording-png-compression'):
+                 'recording-video-crf'):
         parser.add_argument('--' + name, required=True, type=int)
     for name in ('control-hz', 'policy-timeout-s', 'load-timeout-s', 'feedback-timeout-s',
                  'command-velocity', 'max-joint-step', 'max-target-jump', 'max-tracking-error',
@@ -712,7 +816,7 @@ def parse_args():
         parser.add_argument('--' + name, required=True, type=float, nargs=6)
     args = parser.parse_args()
     exceptions = {'seed', 'save_observations', 'gripper_closed', 'gripper_open',
-                  'recording_png_compression'}
+                  'recording_video_crf'}
     for key, value in vars(args).items():
         if isinstance(value, (int, float)) and key not in exceptions:
             if not np.isfinite(value) or value <= 0:
@@ -721,8 +825,8 @@ def parse_args():
         parser.error('execute-steps must be in [1, 50]')
     if args.save_observations not in (0, 1):
         parser.error('save-observations must be 0 or 1')
-    if not 0 <= args.recording_png_compression <= 9:
-        parser.error('recording-png-compression must be in [0, 9]')
+    if not 0 <= args.recording_video_crf <= 51:
+        parser.error('recording-video-crf must be in [0, 51]')
     if not 0 < args.motor_timeout_ms <= 32760:
         parser.error('motor-timeout-ms must be in [1, 32760]')
     if args.motor_timeout_ms <= 2000 / args.control_hz:

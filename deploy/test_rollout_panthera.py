@@ -6,6 +6,7 @@ import queue
 import json
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
 import threading
 import time
@@ -15,7 +16,8 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 
-from rollout_panthera import Cameras, FrameRecorder, JointMapping, RobotControl, guard_target, run
+from rollout_panthera import (Cameras, FrameRecorder, H264VideoWriter, JointMapping,
+                             RobotControl, guard_target, run)
 
 
 def arguments():
@@ -133,7 +135,7 @@ def camera_args(**overrides):
     values = dict(head_serial='head', wrist_serial='wrist', camera_width=8,
                   camera_height=6, camera_fps=30, camera_timeout_ms=100,
                   camera_warmup_frames=2, recording_queue_size=128,
-                  recording_flush_timeout_s=2, recording_png_compression=0)
+                  recording_flush_timeout_s=5, recording_video_crf=23)
     values.update(overrides)
     return SimpleNamespace(**values)
 
@@ -210,9 +212,10 @@ class CameraRecording(unittest.TestCase):
 
     def metadata(self, number):
         return dict(sequence=number, frame_number=number + 1,
-                    missing_before=0, file=f'{number:08d}.png')
+                    missing_before=0, file='video.mp4', video_frame_index=number,
+                    video_timestamp_s=number / 30)
 
-    def test_continuous_capture_without_model_reads_and_lossless_rgb(self):
+    def test_continuous_capture_h264_frame_alignment_and_rgb_inputs(self):
         import cv2
         rs = FakeRealSense()
         with tempfile.TemporaryDirectory() as directory, patch.dict(sys.modules, pyrealsense2=rs):
@@ -237,13 +240,31 @@ class CameraRecording(unittest.TestCase):
                 folder = Path(directory) / 'camera_frames' / key
                 rows = [json.loads(line) for line in (folder / 'frames.jsonl').read_text().splitlines()]
                 self.assertEqual(len(rows), summary['cameras'][key]['received'])
-                self.assertEqual(len(rows), len(list(folder.glob('*.png'))))
+                self.assertFalse(list(folder.glob('*.png')))
+                probe = json.loads(subprocess.check_output([
+                    'ffprobe', '-v', 'error', '-count_frames', '-select_streams', 'v:0',
+                    '-show_entries', 'stream=codec_name,pix_fmt,nb_read_frames,r_frame_rate',
+                    '-of', 'json', str(folder / 'video.mp4')], text=True))['streams'][0]
+                self.assertEqual(probe['codec_name'], 'h264')
+                self.assertEqual(probe['pix_fmt'], 'yuv420p')
+                self.assertEqual(probe['r_frame_rate'], '30/1')
+                self.assertEqual(int(probe['nb_read_frames']), len(rows))
+                self.assertEqual([r['video_frame_index'] for r in rows], list(range(len(rows))))
+                capture = cv2.VideoCapture(str(folder / 'video.mp4'))
                 self.assertEqual([row['frame_number'] for row in rows], list(range(1, len(rows) + 1)))
                 for row in rows:
-                    image = cv2.cvtColor(cv2.imread(str(folder / row['file'])), cv2.COLOR_BGR2RGB)
-                    np.testing.assert_array_equal(image, FakeFrame(row['frame_number']).get_data())
+                    ok, bgr = capture.read()
+                    self.assertTrue(ok)
+                    image = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                    np.testing.assert_allclose(image, FakeFrame(row['frame_number']).get_data(), atol=6)
+                    self.assertEqual(row['file'], 'video.mp4')
+                    self.assertEqual(row['video_timestamp_s'], row['video_frame_index'] / 30)
+                    self.assertEqual(row['device_timestamp_ms'], row['frame_number'] * 1000 / 30)
                     self.assertEqual(row['timestamp_domain'], 'hardware_clock')
                     self.assertGreater(row['host_monotonic_ns'], 0)
+                    self.assertGreater(row['host_time_ns'], 0)
+                self.assertFalse(capture.read()[0])
+                capture.release()
             self.assertTrue(all(p.stop_calls == 1 for p in rs.pipelines))
 
     def test_disabled_recording_still_reads_current_frames(self):
@@ -305,9 +326,10 @@ class CameraRecording(unittest.TestCase):
             self.assertEqual(summary['cameras']['cam_high']['received'], 2)
 
     def test_disk_write_failure_propagates_to_health_and_summary(self):
-        with tempfile.TemporaryDirectory() as directory, patch('cv2.imwrite', return_value=False):
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+                H264VideoWriter, 'write', side_effect=OSError('Failed to write video')):
             recorder = FrameRecorder(directory, camera_args())
-            recorder.enqueue('cam_high', FakeFrame(1).get_data(), self.metadata(1))
+            recorder.enqueue('cam_high', FakeFrame(1).get_data(), self.metadata(0))
             self.wait_until(lambda: recorder.error is not None)
             with self.assertRaisesRegex(RuntimeError, 'Failed to write'):
                 recorder.health()
@@ -316,6 +338,47 @@ class CameraRecording(unittest.TestCase):
             summary = json.loads((Path(directory) / 'camera_frames/summary.json').read_text())
             self.assertFalse(summary['complete'])
             self.assertEqual(summary['cameras']['cam_high']['saved'], 0)
+
+    def test_encoder_failure_during_finalization_marks_recording_incomplete(self):
+        original_close = H264VideoWriter.close
+        def fail_close(writer):
+            original_close(writer)
+            raise OSError('injected finalization failure')
+        with tempfile.TemporaryDirectory() as directory, patch.object(H264VideoWriter, 'close', fail_close):
+            recorder = FrameRecorder(directory, camera_args())
+            recorder.enqueue('cam_high', FakeFrame(1).get_data(), self.metadata(0))
+            with self.assertRaisesRegex(RuntimeError, 'finalization failure'):
+                recorder.close()
+            summary = json.loads((Path(directory) / 'camera_frames/summary.json').read_text())
+            self.assertFalse(summary['complete'])
+            self.assertIsNotNone(recorder.writers['cam_high'].proc.poll())
+
+    def test_flush_timeout_kills_encoder_and_marks_recording_incomplete(self):
+        entered, release = threading.Event(), threading.Event()
+        original_abort = H264VideoWriter.abort
+        def stall(writer, rgb):
+            entered.set()
+            release.wait(2)
+        def abort(writer):
+            original_abort(writer)
+            release.set()
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(H264VideoWriter, 'write', stall), \
+                patch.object(H264VideoWriter, 'abort', abort):
+            recorder = FrameRecorder(directory, camera_args(recording_flush_timeout_s=.1))
+            recorder.enqueue('cam_high', FakeFrame(1).get_data(), self.metadata(0))
+            self.assertTrue(entered.wait(2))
+            with self.assertRaisesRegex(RuntimeError, 'flush timed out'):
+                recorder.close()
+            self.assertFalse(recorder.thread.is_alive())
+            self.assertIsNotNone(recorder.writers['cam_high'].proc.poll())
+            summary = json.loads((Path(directory) / 'camera_frames/summary.json').read_text())
+            self.assertFalse(summary['complete'])
+
+    def test_missing_ffmpeg_fails_before_recording_starts(self):
+        with tempfile.TemporaryDirectory() as directory, patch('rollout_panthera.shutil.which', return_value=None):
+            with self.assertRaisesRegex(RuntimeError, 'requires ffmpeg'):
+                FrameRecorder(directory, camera_args())
 
     def test_run_records_during_inference_and_flushes_on_interrupt_or_step_limit(self):
         for interrupt in (False, True):
@@ -350,11 +413,16 @@ class CameraRecording(unittest.TestCase):
                 summary = json.loads((folder / 'camera_frames/summary.json').read_text())
                 self.assertTrue(summary['complete'])
                 self.assertTrue(all(c['saved'] >= 10 for c in summary['cameras'].values()))
-                self.assertTrue((folder / 'observation_00000.npz').is_file())
+                self.assertTrue((folder / 'observation/00000.npz').is_file())
                 if not interrupt:
                     row = json.loads((folder / 'rollout.jsonl').read_text())
                     for key, meta in row['camera_frames'].items():
                         self.assertTrue((folder / 'camera_frames' / key / meta['file']).exists())
+                        rows = [json.loads(line) for line in
+                                (folder / 'camera_frames' / key / 'frames.jsonl').read_text().splitlines()]
+                        self.assertEqual(rows[meta['video_frame_index']], meta)
+                        with np.load(folder / 'observation/00000.npz') as data:
+                            np.testing.assert_array_equal(data[key], FakeFrame(meta['frame_number']).get_data())
 
 
 if __name__ == '__main__':

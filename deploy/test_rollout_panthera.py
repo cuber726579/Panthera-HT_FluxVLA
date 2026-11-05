@@ -5,6 +5,7 @@ Run: conda run -n panthera python -m unittest discover -s deploy -p 'test_*.py'
 import contextlib
 import queue
 import json
+import signal
 from pathlib import Path
 import sys
 import subprocess
@@ -286,16 +287,34 @@ class ReturnToZero(unittest.TestCase):
             controller.close()
         self.assertIsNone(controller.robot)
 
-    def test_interrupt_during_close_aborts_home(self):
+    def test_repeated_ctrl_c_during_close_keeps_homing_and_original_interrupt(self):
         controller = self.prepared()
+        original = KeyboardInterrupt('first Ctrl+C')
+        previous_sigint = signal.getsignal(signal.SIGINT)
         def interrupted_wait(_):
+            self.assertEqual(signal.getsignal(signal.SIGINT), signal.SIG_IGN)
+            signal.raise_signal(signal.SIGINT)
+            signal.raise_signal(signal.SIGINT)
+            self.assertFalse(controller.home_abort.is_set())
             controller.control_done.set()
-            raise KeyboardInterrupt()
         with patch.object(controller.control_done, 'wait', side_effect=interrupted_wait):
-            with self.assertRaises(KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt) as caught:
+                with contextlib.ExitStack() as stack:
+                    stack.callback(controller.close)
+                    raise original
+        self.assertIs(caught.exception, original)
+        self.assertFalse(controller.home_abort.is_set())
+        self.assertIsNone(controller.robot)
+        self.assertEqual(signal.getsignal(signal.SIGINT), previous_sigint)
+
+    def test_cleanup_timeout_still_aborts_home_and_restores_sigint(self):
+        controller = self.prepared()
+        previous_sigint = signal.getsignal(signal.SIGINT)
+        with patch('rollout_panthera.time.monotonic', side_effect=[0., 100.]):
+            with self.assertRaisesRegex(RuntimeError, 'SDK cleanup did not finish'):
                 controller.close()
         self.assertTrue(controller.home_abort.is_set())
-        self.assertIsNone(controller.robot)
+        self.assertEqual(signal.getsignal(signal.SIGINT), previous_sigint)
 
 
 def camera_args(**overrides):

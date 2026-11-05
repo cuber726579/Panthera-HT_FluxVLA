@@ -679,8 +679,7 @@ class RobotControl:
         if duration + 0.5 >= args.return_zero_timeout_s:
             raise ValueError('Return-to-zero timeout is too short for the bounded trajectory')
         print(f'Returning six SDK joints to zero: duration={duration:.2f}s, '
-              f'velocity<={speed:.3f}rad/s; keeping gripper target. '
-              'Press Ctrl+C again to cancel.', flush=True)
+              f'velocity<={speed:.3f}rad/s; keeping gripper target.', flush=True)
         began = last_tick = time.monotonic()
         progress, settled_since = 0.0, None
         while True:
@@ -739,29 +738,28 @@ class RobotControl:
     def close(self):
         if self.robot is None:
             return
-        self.stop_event.set()
-        deadline = time.monotonic() + self.args.return_zero_timeout_s + 2
-        interrupted = False
-        while not self.control_done.is_set():
-            try:
+        # The first Ctrl+C starts cleanup; further Ctrl+C must not interrupt
+        # homing or thread shutdown. Restore the caller's handler afterwards.
+        main_thread = threading.current_thread() is threading.main_thread()
+        previous_sigint = signal.signal(signal.SIGINT, signal.SIG_IGN) if main_thread else None
+        try:
+            self.stop_event.set()
+            deadline = time.monotonic() + self.args.return_zero_timeout_s + 2
+            while not self.control_done.is_set():
                 if time.monotonic() >= deadline:
                     self.home_abort.set()
                     raise RuntimeError('SDK cleanup did not finish; motor watchdog remains active')
                 self.control_done.wait(0.05)
-            except KeyboardInterrupt:
-                interrupted = True
-                self.home_abort.set()
-                deadline = min(deadline, time.monotonic() + 2)
-                print('Cancelling return to zero; stopping robot.', flush=True)
-        self.thread.join(timeout=2)
-        if self.thread.is_alive():
-            raise RuntimeError('SDK thread did not stop; motor watchdog remains active')
-        # The SDK destructor also applies its configured brake/stop policy.
-        self.robot = None
-        if interrupted:
-            raise KeyboardInterrupt('Return to zero cancelled')
-        if self.return_error is not None:
-            raise RuntimeError(f'Robot exit cleanup failed: {self.return_error}') from self.return_error
+            self.thread.join(timeout=2)
+            if self.thread.is_alive():
+                raise RuntimeError('SDK thread did not stop; motor watchdog remains active')
+            # The SDK destructor also applies its configured brake/stop policy.
+            self.robot = None
+            if self.return_error is not None:
+                raise RuntimeError(f'Robot exit cleanup failed: {self.return_error}') from self.return_error
+        finally:
+            if main_thread:
+                signal.signal(signal.SIGINT, previous_sigint)
 
 
 def sdk_serial_ports(motor_config):

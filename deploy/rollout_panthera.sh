@@ -27,7 +27,7 @@ CAMERA_FPS=30
 CAMERA_TIMEOUT_MS=1000
 CAMERA_WARMUP_FRAMES=15
 CONTROL_HZ=30
-EXECUTE_STEPS=20                   # 模型每次预测 50 步，只执行前 10 步后重新观测
+EXECUTE_STEPS=25                   # 模型每次预测 50 步，只执行前 10 步后重新观测
 MAX_STEPS=600                      # 单次启动只跑一轮，不自动复位/重复
 SMOKE_CHUNKS=2
 POLICY_TIMEOUT_S=30
@@ -38,7 +38,7 @@ RETURN_TO_ZERO_ON_EXIT=1           # rollout 退出时回到 SDK 六关节零位
 RETURN_ZERO_VELOCITY=0.3           # 回零速度上限 rad/s，同时受原控制速度/步长上限约束
 RETURN_ZERO_TIMEOUT_S=45           # 回零全过程超时，包含到位等待
 RETURN_ZERO_TOLERANCE=0.03         # 六关节实测到位容差 rad
-COMMAND_VELOCITY=0.3               # SDK 速度上限 rad/s
+COMMAND_VELOCITY=0.25               # SDK 速度上限 rad/s
 MAX_JOINT_STEP=0.04                # 同时受 COMMAND_VELOCITY/CONTROL_HZ 限制
 MAX_TARGET_JUMP=0.75               # 单条目标距上一命令过大则终止 rad
 MAX_TRACKING_ERROR=0.35            # 已发送目标与实测位置差值上限 rad
@@ -62,7 +62,7 @@ RECORDING_FLUSH_TIMEOUT_S=30        # 退出时停止采集，再等待已接收
 # rollout: 控制线程持续保持上一目标；每次执行 EXECUTE_STEPS 后重新观测。
 # dry-run/rollout 都要求 SDK 串口空闲，不可与遥操作或机械臂后台服务共用。
 # rollout 正常结束、Ctrl+C 或上层异常退出时先回零，再调用 SDK set_stop。
-# 回零保持夹爪目标，再次 Ctrl+C 取消；电机/反馈/跟踪故障时直接停止，不回零。
+# 回零保持夹爪目标，期间忽略再次 Ctrl+C；电机/反馈/跟踪故障时直接停止，不回零。
 # SDK 析构还会执行 YAML 的 exit_motor_brake_flag 行为。
 # 本地数据来自仿真；相机摆位、关节符号/零位、夹爪行程需按实机对齐。
 

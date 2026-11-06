@@ -1105,7 +1105,26 @@ pip install numpy==1.26.4
 
 `deploy/rollout_panthera.sh` 继续使用原有的
 `configs/pi05/pi05_paligemma_panthera_inference.py`，不需要新增 RTC 模型配置。
-默认仍为同步执行；参数可在同一个 shell 文件中修改，也可通过以下环境变量切换：
+默认仍为同步执行；部署参数集中在
+[`deploy/config/rollout_panthera.yaml`](deploy/config/rollout_panthera.yaml)。
+`runtime` 配置 Conda 环境和 CUDA 设备，`rollout` 配置模型、相机、控制、RTC 和日志参数。
+启动器使用当前 `python3` 读取 YAML（需要 PyYAML），再切换到配置中的机械臂 Python 环境。
+配置内的相对路径以仓库根目录为基准，支持 `${ROOT}`、`${SDK_ROOT}` 和 `~`。
+相机序列号请保留引号。
+
+```bash
+# 使用默认 YAML；位置参数覆盖 YAML 中的 mode
+bash deploy/rollout_panthera.sh smoke
+
+# 使用其他配置文件（--config 的相对路径以当前工作目录为基准）
+bash deploy/rollout_panthera.sh smoke --config deploy/config/my_panthera.yaml
+
+# 仅检查解析后的启动命令，不加载模型或打开硬件
+bash deploy/rollout_panthera.sh --print-command
+```
+
+`INFERENCE_MODE`、`RTC_METHOD`、`RTC_DELAY_STEPS`、`RTC_USE_VJP` 的非空环境变量
+仍可覆盖 YAML 中对应的小写字段：
 
 ```bash
 # 真实 CUDA 推理检查；不打开机械臂或相机
@@ -1121,12 +1140,12 @@ INFERENCE_MODE=async RTC_METHOD=none bash deploy/rollout_panthera.sh rollout
 INFERENCE_MODE=sync RTC_METHOD=none bash deploy/rollout_panthera.sh rollout
 ```
 
-模型仍输出 50 步。同步模式的 `EXECUTE_STEPS` 是每块执行步数；异步模式中它是
+模型仍输出 50 步。同步模式的 `rollout.execute_steps` 是每块执行步数；异步模式中它是
 两次推理起点之间的动作步数上限，缓冲不足时会提前推理。控制线程在推理期间
 继续执行旧轨迹，每周期执行一个 action，不改变现有关节/夹爪限幅规则。
 
 `RTC_DELAY_STEPS=0` 按最近 20 次请求端到端延迟的 P95、初始下限及
-`RTC_MARGIN_STEPS` 估算预留前缀；首次模型预热不计入。设为 1～48 可固定长度。
+`rollout.rtc_margin_steps` 估算预留前缀；首次模型预热不计入。设为 1～48 可固定长度。
 只有一个推理请求在途，新结果只替换预定切换边界以后的动作；晚到结果丢弃。
 缓冲耗尽时保持上一目标并退出到原清理流程，不重复播放旧动作。
 该流程不会修复已有的反馈超时或回零故障。

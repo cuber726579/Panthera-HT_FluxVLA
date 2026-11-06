@@ -1101,6 +1101,54 @@ pip install numpy==1.26.4
 - **提交前跑检查**：确保本地 pre-commit 通过、CI 为绿后再提 PR。
 - **提交信息规范**：建议使用 Conventional Commits（示例见贡献指南）。
 
+## Panthera 部署：异步推理与 RTC
+
+`deploy/rollout_panthera.sh` 继续使用原有的
+`configs/pi05/pi05_paligemma_panthera_inference.py`，不需要新增 RTC 模型配置。
+默认仍为同步执行；参数可在同一个 shell 文件中修改，也可通过以下环境变量切换：
+
+```bash
+# 真实 CUDA 推理检查；不打开机械臂或相机
+INFERENCE_MODE=async RTC_METHOD=guidance bash deploy/rollout_panthera.sh smoke
+
+# 实机：异步执行 + 推理期 guidance（默认不计算 VJP，属于近似校正）
+INFERENCE_MODE=async RTC_METHOD=guidance bash deploy/rollout_panthera.sh rollout
+
+# 对照：仅异步，不使用 RTC
+INFERENCE_MODE=async RTC_METHOD=none bash deploy/rollout_panthera.sh rollout
+
+# 恢复同步执行
+INFERENCE_MODE=sync RTC_METHOD=none bash deploy/rollout_panthera.sh rollout
+```
+
+模型仍输出 50 步。同步模式的 `EXECUTE_STEPS` 是每块执行步数；异步模式中它是
+两次推理起点之间的动作步数上限，缓冲不足时会提前推理。控制线程在推理期间
+继续执行旧轨迹，每周期执行一个 action，不改变现有关节/夹爪限幅规则。
+
+`RTC_DELAY_STEPS=0` 按最近 20 次请求端到端延迟的 P95、初始下限及
+`RTC_MARGIN_STEPS` 估算预留前缀；首次模型预热不计入。设为 1～48 可固定长度。
+只有一个推理请求在途，新结果只替换预定切换边界以后的动作；晚到结果丢弃。
+缓冲耗尽时保持上一目标并退出到原清理流程，不重复播放旧动作。
+该流程不会修复已有的反馈超时或回零故障。
+
+RTC 条件取自限幅后计划下发的绝对目标，按本次输入状态重算前六维增量，
+夹爪保留绝对开度，再复用原动作统计量归一化。实际下发仍检查关节限位、
+目标跳变与实测跟踪误差。默认保留 `previous-target` 状态语义。
+
+`RTC_METHOD=prefix` 提供硬前缀条件作为实验对照，效果需结合 checkpoint 训练方式验证。
+`RTC_USE_VJP=1` 仅用于 guidance，会启用输入梯度校正，应重新测量推理延迟。
+`smoke` 至少运行两次预测才会覆盖 RTC；第二次会改变状态并检查 prefix 重建误差。
+异步调度目前用于 `rollout`；`dry-run` 保持同步预览语义。
+
+`rollout.jsonl` 新增 `inference_request`，预测记录含 `origin`、`boundary`、
+`accepted`、`discard_reason`、`end_to_end_s` 和实际启用的 `rtc_method`。
+动作记录含单调时钟时间和轨迹版本；步数指已下发动作，不代表物理到位。
+
+```bash
+# 无硬件的调度、IPC、退出与原控制回归测试
+/home/sunteng/miniconda3/envs/panthera/bin/python -m unittest discover -s deploy -p 'test_*.py'
+```
+
 ## 支持
 
 如果你在使用本仓库时遇到问题，欢迎联系我们。你可以直接联系 [mason@limxdynamics.com](mason@limxdynamics.com) 和 [wayne@limxdynamics.com](wayne@limxdynamics.com)，或在 Github 提交 issue 获取帮助。

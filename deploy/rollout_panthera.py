@@ -25,6 +25,8 @@ import time
 
 import numpy as np
 
+from action_scheduler import ActionBuffer, DelayBudget, relative_rtc_actions
+
 
 def vector(value, size, name):
     value = np.asarray(value, dtype=np.float64)
@@ -100,6 +102,16 @@ class Policy:
         denorm_cfg = copy.deepcopy(cfg.inference.denormalize_action)
         denorm_cfg['norm_stats'] = args.statistics
         self.denormalize = build_transform_from_cfg(denorm_cfg)
+        self.rtc_method = getattr(args, 'rtc_method', 'none')
+        if self.rtc_method != 'none':
+            if denorm_cfg['type'] != 'DenormalizeDeltaAction':
+                raise ValueError('RTC requires the existing delta-action decoder')
+            self.rtc_mask = denorm_cfg['delta_action_mask']
+            normalizers = [t for t in data_cfg['transforms']
+                           if t['type'] == 'NormalizeStatesAndActions']
+            if len(normalizers) != 1:
+                raise ValueError('RTC requires exactly one action normalizer')
+            self.rtc_normalize = build_transform_from_cfg(copy.deepcopy(normalizers[0]))
         with safe_open(args.checkpoint, framework='pt', device='cpu') as f:
             tensor_count = len(list(f.keys()))
         self.info = dict(device=torch.cuda.get_device_name(), torch=torch.__version__,
@@ -131,18 +143,41 @@ class Policy:
         with np.load(path, allow_pickle=False) as data:
             state = vector(data['qpos'], 7, 'observation state').astype(np.float32)
             obs = {key: data[key] for key in ('cam_high', 'cam_left_wrist')}
+            prev = data['rtc_actions'].copy() if 'rtc_actions' in data else None
+            prefix_len = int(data['rtc_prefix_len']) if prev is not None else 0
         obs.update(qpos=state, task_description=self.args.instruction)
         start = time.monotonic()
         batch = self.dataset(obs)
         if not self.info['loaded']:
             return dict(shapes={k: list(v.shape) for k, v in batch.items()})
         torch = self.torch
-        with torch.inference_mode(), torch.autocast('cuda', dtype=torch.bfloat16):
-            raw = self.model.predict_action(**batch)
+        rtc_inputs = {}
+        if prev is not None and self.rtc_method != 'none':
+            if not 0 < prefix_len < min(50, len(prev) + 1):
+                raise ValueError('Invalid RTC prefix length')
+            relative = relative_rtc_actions(prev, state, self.rtc_mask)
+            normalized = self.rtc_normalize(dict(
+                states=state.copy(), actions=relative,
+                stats=self.dataset.norm_stats['private']))['actions']
+            # Preserve model-space padding, including for guidance (not just prefix).
+            normalized = np.pad(normalized, ((0, 0), (0, self.model.max_action_dim - 7)))
+            rtc_inputs = dict(
+                prev_actions=torch.as_tensor(normalized[None], device='cuda', dtype=torch.float32),
+                prefix_len=prefix_len,
+                rtc_config=dict(method=self.rtc_method,
+                                decay_end=min(len(prev), prefix_len + self.args.rtc_decay_steps),
+                                max_guidance_weight=self.args.rtc_guidance_weight,
+                                use_vjp=bool(self.args.rtc_use_vjp)))
+        # VJP needs input gradients even though model parameters stay frozen.
+        grad_context = torch.no_grad if rtc_inputs and self.args.rtc_use_vjp else torch.inference_mode
+        with grad_context(), torch.autocast('cuda', dtype=torch.bfloat16):
+            raw = self.model.predict_action(**batch, **rtc_inputs)
         actions = self.denormalize(dict(action=raw.float().cpu().numpy(), state=state))
         if actions.shape != (50, 7) or not np.isfinite(actions).all():
             raise RuntimeError(f'Invalid model actions: {actions.shape}')
         return dict(actions=actions.tolist(), elapsed_s=time.monotonic() - start,
+                    rtc_method=self.rtc_method if rtc_inputs else 'none',
+                    rtc_prefix_len=prefix_len if rtc_inputs else 0,
                     peak_cuda_mb=torch.cuda.max_memory_allocated() / 2**20)
 
 
@@ -157,7 +192,9 @@ def worker(config_path):
         print(json.dumps(dict(ready=policy.info)), file=output)
         for line in sys.stdin:
             request = json.loads(line)
-            print(json.dumps(policy.predict(request['path']), allow_nan=False), file=output)
+            result = policy.predict(request['path'])
+            result['request_id'] = request['request_id']
+            print(json.dumps(result, allow_nan=False), file=output, flush=True)
     except Exception as exc:
         print(json.dumps(dict(error=f'{type(exc).__name__}: {exc}')), file=output)
         raise
@@ -175,6 +212,8 @@ class PolicyProcess:
             start_new_session=True)
         self.selector = selectors.DefaultSelector()
         self.selector.register(self.proc.stdout, selectors.EVENT_READ)
+        self.pending = None
+        self.next_request_id = 0
 
     def receive(self, timeout, health=lambda: None):
         deadline = time.monotonic() + timeout
@@ -190,12 +229,50 @@ class PolicyProcess:
                 return result
         raise TimeoutError(f'Policy response timed out after {timeout}s')
 
-    def predict(self, obs, health=lambda: None):
-        path = self.directory / 'observation.npz'
-        np.savez(path, **obs)
-        self.proc.stdin.write(json.dumps(dict(path=str(path))) + '\n')
+    def submit(self, obs, rtc=None):
+        if self.pending is not None:
+            raise RuntimeError('Only one policy request may be in flight')
+        request_id = self.next_request_id
+        self.next_request_id += 1
+        path = self.directory / f'observation_{request_id:06d}.npz'
+        began = time.monotonic()
+        payload = dict(obs)
+        if rtc is not None:
+            payload.update(rtc_actions=rtc['actions'], rtc_prefix_len=rtc['prefix_len'])
+        np.savez(path, **payload)
+        self.pending = dict(request_id=request_id, path=path, began=began)
+        self.proc.stdin.write(json.dumps(dict(path=str(path), request_id=request_id)) + '\n')
         self.proc.stdin.flush()
-        return self.receive(self.args.policy_timeout_s, health)
+        return request_id
+
+    def poll(self, health=lambda: None):
+        health()
+        if self.pending is None:
+            return None
+        if time.monotonic() - self.pending['began'] > self.args.policy_timeout_s:
+            raise TimeoutError('Policy response timed out')
+        if not self.selector.select(0):
+            return None
+        line = self.proc.stdout.readline()
+        if not line:
+            raise RuntimeError(f'Policy process exited: {self.proc.poll()}')
+        result = json.loads(line)
+        if 'error' in result:
+            raise RuntimeError(result['error'])
+        if result.get('request_id') != self.pending['request_id']:
+            raise RuntimeError('Policy response request ID mismatch')
+        result['roundtrip_s'] = time.monotonic() - self.pending['began']
+        self.pending['path'].unlink(missing_ok=True)
+        self.pending = None
+        return result
+
+    def predict(self, obs, health=lambda: None, rtc=None):
+        self.submit(obs, rtc)
+        while True:
+            result = self.poll(health)
+            if result is not None:
+                return result
+            time.sleep(.005)
 
     def close(self):
         if self.proc.poll() is None:
@@ -548,6 +625,10 @@ class RobotControl:
         self.home_abort, self.control_done = threading.Event(), threading.Event()
         self.return_error = None
         self.lock, self.commands = threading.Lock(), queue.Queue(maxsize=1)
+        self.action_buffer = (ActionBuffer(args.max_steps)
+                              if getattr(args, 'inference_mode', 'sync') == 'async'
+                              and args.mode == 'rollout' else None)
+        self.async_events = queue.Queue(maxsize=4096)
         self.error = None
         self.measured = self.last_target = None
         self.last_stamps = np.zeros(7)
@@ -597,33 +678,48 @@ class RobotControl:
                     continue
                 if np.any(measured[:6] < lower) or np.any(measured[:6] > upper):
                     raise ValueError('Measured joints outside configured SDK limits')
-                if self.last_target is None:
-                    self.last_target = measured.copy()
-                pending = None
-                try:
-                    pending = self.commands.get_nowait()
-                except queue.Empty:
-                    pass
-                target = self.last_target.copy()
-                if pending is not None:
-                    target = guard_target(self.mapping.to_sdk(pending[0]), target, measured,
-                                          self.args, lower, upper)
-                if active:
-                    if np.max(np.abs(target[:6] - measured[:6])) > self.args.max_tracking_error:
-                        raise ValueError('Tracking error exceeds configured limit')
-                    # Differentiate consecutive SDK targets at the control rate,
-                    # not encoder error. Repeated hold targets have zero velocity.
-                    target_velocity = np.clip(
-                        (target[:6] - self.last_target[:6]) * self.args.control_hz,
-                        -self.args.command_velocity, self.args.command_velocity)
-                    if not self.robot.Joint_Pos_Vel(target[:6], target_velocity,
-                                                    self.args.max_torque, iswait=False):
-                        raise RuntimeError('SDK rejected joint command')
-                    if not self.robot.gripper_control(target[6], self.args.gripper_velocity,
-                                                       self.args.gripper_torque):
-                        raise RuntimeError('SDK rejected gripper command')
                 with self.lock:
+                    if self.stop_event.is_set():
+                        break
+                    if self.last_target is None:
+                        self.last_target = measured.copy()
+                    pending = None
+                    buffer = getattr(self, 'action_buffer', None)
+                    buffered = buffer.peek() if buffer is not None else None
+                    if buffer is None:
+                        try:
+                            pending = self.commands.get_nowait()
+                        except queue.Empty:
+                            pass
+                    target = self.last_target.copy()
+                    requested = buffered[0] if buffered is not None else (pending[0] if pending else None)
+                    if requested is not None:
+                        target = guard_target(self.mapping.to_sdk(requested), target, measured,
+                                              self.args, lower, upper)
+                    if buffered is not None and not np.allclose(
+                            self.mapping.to_policy(target), buffered[1], atol=1e-9, rtol=0):
+                        raise RuntimeError('Command no longer matches committed RTC prefix')
+                    if active:
+                        if np.max(np.abs(target[:6] - measured[:6])) > self.args.max_tracking_error:
+                            raise ValueError('Tracking error exceeds configured limit')
+                        target_velocity = np.clip(
+                            (target[:6] - self.last_target[:6]) * self.args.control_hz,
+                            -self.args.command_velocity, self.args.command_velocity)
+                        if not self.robot.Joint_Pos_Vel(target[:6], target_velocity,
+                                                        self.args.max_torque, iswait=False):
+                            raise RuntimeError('SDK rejected joint command')
+                        if not self.robot.gripper_control(target[6], self.args.gripper_velocity,
+                                                           self.args.gripper_torque):
+                            raise RuntimeError('SDK rejected gripper command')
                     self.measured, self.last_target = measured, target
+                    if buffered is not None:
+                        step = buffer.cursor
+                        buffer.advance(self.mapping.to_policy(target))
+                        self.async_events.put_nowait(dict(
+                            event='command', step=step, plan_version=buffer.version,
+                            host_monotonic_ns=time.monotonic_ns(),
+                            requested=requested.tolist(), sent=self.mapping.to_policy(target).tolist(),
+                            measured=self.mapping.to_policy(measured).tolist()))
                 self.ready.set()
                 if pending is not None:
                     pending[1].set()
@@ -724,6 +820,42 @@ class RobotControl:
             if self.measured is None:
                 raise RuntimeError('Robot feedback not ready')
             return self.mapping.to_policy(self.measured), self.mapping.to_policy(self.last_target)
+
+    def async_snapshot(self, prefix_len=None):
+        self.health()
+        with self.lock:
+            buffer = self.action_buffer
+            result = dict(cursor=buffer.cursor, remaining=buffer.remaining,
+                          started=buffer.started, version=buffer.version)
+            if prefix_len is not None:
+                result.update(reservation=buffer.reserve(prefix_len),
+                              measured=self.mapping.to_policy(self.measured),
+                              state=self.mapping.to_policy(self.last_target),
+                              old_actions=buffer.effective.copy())
+            return result
+
+    def install_prediction(self, reservation, actions):
+        actions = np.asarray(actions, dtype=np.float64)
+        if actions.shape != (50, 7) or not np.isfinite(actions).all():
+            raise ValueError('Policy must return 50 finite 7D actions')
+        self.health()
+        with self.lock:
+            buffer = self.action_buffer
+            if not buffer.accepts(reservation):
+                return False
+            keep = reservation.boundary - buffer.cursor
+            previous = (self.mapping.to_sdk(buffer.effective[keep - 1])
+                        if keep else self.last_target.copy())
+            requested = actions[reservation.prefix_len:]
+            effective = []
+            lower, upper = self.robot.joint_limits['lower'], self.robot.joint_limits['upper']
+            for action in requested:
+                # Same command projection as the live path; measured-state
+                # guards are still applied independently at every real tick.
+                previous = guard_target(self.mapping.to_sdk(action), previous, previous,
+                                        self.args, lower, upper)
+                effective.append(self.mapping.to_policy(previous))
+            return buffer.install(reservation, requested, effective)
 
     def send(self, action):
         done = threading.Event()
@@ -858,6 +990,93 @@ def register_cleanup(stack, resource, name, log_dir):
     stack.push(close)
 
 
+def run_async(args, robot, cameras, policy, log, observation_dir):
+    """One in-flight request; SDK thread keeps consuming the committed buffer."""
+    delay = DelayBudget(args.control_hz, args.rtc_initial_delay_s,
+                        args.rtc_margin_steps, args.rtc_delay_steps)
+    pending, next_origin, chunk = None, 0, 0
+
+    def health():
+        robot.health()
+        cameras.health()
+
+    def write(event):
+        log.write(json.dumps(event, allow_nan=False) + '\n')
+
+    def drain():
+        while True:
+            try:
+                write(robot.async_events.get_nowait())
+            except queue.Empty:
+                return
+
+    try:
+        while True:
+            health()
+            drain()
+            status = robot.async_snapshot()
+            if status['cursor'] >= args.max_steps:
+                return
+            if status['started'] and not status['remaining']:
+                write(dict(event='buffer_exhausted', **status))
+                raise RuntimeError('Async action buffer exhausted; leaving rollout for normal cleanup')
+            if pending is not None:
+                result = policy.poll(health)
+                if result is not None:
+                    elapsed = time.monotonic() - pending['began']
+                    reservation = pending['reservation']
+                    # The initial CUDA invocation is not a steady-state delay sample.
+                    if reservation.prefix_len:
+                        delay.observe(elapsed)
+                    accepted = robot.install_prediction(reservation, result['actions'])
+                    write(dict(event='prediction', chunk=pending['chunk'],
+                               state=pending['state'].tolist(), measured=pending['measured'].tolist(),
+                               camera_frames=pending['camera_frames'],
+                               origin=reservation.origin, boundary=reservation.boundary,
+                               source_version=reservation.version, accepted=accepted,
+                               discard_reason=None if accepted else 'late_or_stale',
+                               end_to_end_s=elapsed, **result))
+                    print(f'async chunk={pending["chunk"]} origin={reservation.origin} '
+                          f'boundary={reservation.boundary} accepted={accepted} '
+                          f'latency={elapsed:.3f}s rtc={result.get("rtc_method", "none")}', flush=True)
+                    next_origin = (reservation.origin + args.execute_steps if accepted
+                                   else robot.async_snapshot()['cursor'])
+                    pending = None
+                    status = robot.async_snapshot()
+            if pending is None and status['remaining'] < args.max_steps - status['cursor']:
+                prefix_len = delay.steps() if status['started'] else 0
+                # Trigger early enough that a whole committed prefix remains.
+                due = min(next_origin, status['cursor'] + status['remaining'] - prefix_len - 1)
+                if status['cursor'] >= due:
+                    began = time.monotonic()
+                    obs, frames = cameras.read(with_metadata=True)
+                    snapshot = robot.async_snapshot(prefix_len)
+                    state = snapshot['state'] if args.state_source == 'previous-target' else snapshot['measured']
+                    obs['qpos'] = state.astype(np.float32)
+                    rtc = (dict(actions=snapshot['old_actions'], prefix_len=prefix_len)
+                           if prefix_len and args.rtc_method != 'none' else None)
+                    if args.save_observations:
+                        np.savez(observation_dir / f'{chunk:05d}.npz', **obs)
+                    request_id = policy.submit(obs, rtc)
+                    pending = dict(chunk=chunk, began=began, reservation=snapshot['reservation'],
+                                   state=state, measured=snapshot['measured'], camera_frames=frames)
+                    write(dict(event='inference_request', request_id=request_id, chunk=chunk,
+                               origin=snapshot['reservation'].origin, prefix_len=prefix_len,
+                               source_version=snapshot['version'],
+                               host_monotonic_ns=time.monotonic_ns()))
+                    chunk += 1
+            time.sleep(min(.005, 1 / args.control_hz))
+    except BaseException as exc:
+        write(dict(event='async_exit', error_type=type(exc).__name__, error=str(exc)))
+        raise
+    finally:
+        # Freeze policy consumption before draining logs, including on Ctrl+C.
+        # RobotControl.close remains responsible for the existing homing path.
+        with robot.lock:
+            robot.stop_event.set()
+        drain()
+
+
 def run(args):
     mapping = preflight(args)
     stamp = time.strftime('%Y%m%d_%H%M%S')
@@ -876,8 +1095,23 @@ def run(args):
             obs = dict(qpos=np.zeros(7, dtype=np.float32),
                        cam_high=np.zeros((args.camera_height, args.camera_width, 3), np.uint8),
                        cam_left_wrist=np.zeros((args.camera_height, args.camera_width, 3), np.uint8))
+            previous_actions = None
             for index in range(1 if args.mode == 'check' else args.smoke_chunks):
-                result = policy.predict(obs)
+                rtc = None
+                if previous_actions is not None and getattr(args, 'rtc_method', 'none') != 'none':
+                    rtc = dict(actions=previous_actions, prefix_len=min(8, len(previous_actions)))
+                    # Exercise rebasing, not only reuse at an identical state.
+                    obs['qpos'] = obs['qpos'].copy()
+                    obs['qpos'][:6] += .01
+                result = policy.predict(obs, rtc=rtc)
+                if rtc is not None:
+                    error = float(np.max(np.abs(np.asarray(result['actions'])[:rtc['prefix_len']]
+                                                - rtc['actions'][:rtc['prefix_len']])))
+                    result['rtc_prefix_max_error'] = error
+                    if args.rtc_method == 'prefix' and error > 1e-4:
+                        raise RuntimeError(f'RTC prefix rebase roundtrip failed: {error}')
+                if 'actions' in result:
+                    previous_actions = np.asarray(result['actions'])
                 log.write(json.dumps(dict(chunk=index, **result), allow_nan=False) + '\n')
                 summary = {k: v for k, v in result.items() if k != 'actions'}
                 if 'actions' in result:
@@ -895,6 +1129,9 @@ def run(args):
         register_cleanup(stack, robot, 'robot', log_dir)
         robot.ready.wait(args.feedback_timeout_s + 1)
         measured, previous = robot.snapshot()
+        if getattr(args, 'inference_mode', 'sync') == 'async' and args.mode == 'rollout':
+            run_async(args, robot, cameras, policy, log, observation_dir)
+            return
         def health():
             robot.health()
             cameras.health()
@@ -939,6 +1176,15 @@ def parse_args():
     parser.add_argument('--return-zero-velocity', type=float, default=0.3)
     parser.add_argument('--return-zero-timeout-s', type=float, default=45.0)
     parser.add_argument('--return-zero-tolerance', type=float, default=0.03)
+    parser.add_argument('--inference-mode', choices=['sync', 'async'], default='sync')
+    parser.add_argument('--rtc-method', choices=['none', 'guidance', 'prefix'], default='none')
+    parser.add_argument('--rtc-delay-steps', type=int, default=0,
+                        help='0 estimates delay from recent end-to-end latency')
+    parser.add_argument('--rtc-initial-delay-s', type=float, default=.3)
+    parser.add_argument('--rtc-margin-steps', type=int, default=2)
+    parser.add_argument('--rtc-decay-steps', type=int, default=8)
+    parser.add_argument('--rtc-guidance-weight', type=float, default=5.)
+    parser.add_argument('--rtc-use-vjp', type=int, choices=[0, 1], default=0)
     for name in ('policy-python', 'sdk-root', 'robot-config', 'model-config', 'checkpoint',
                  'statistics', 'tokenizer-root', 'instruction', 'head-serial', 'wrist-serial', 'log-root'):
         parser.add_argument('--' + name, required=True)
@@ -956,7 +1202,8 @@ def parse_args():
         parser.add_argument('--' + name, required=True, type=float, nargs=6)
     args = parser.parse_args()
     exceptions = {'seed', 'save_observations', 'gripper_closed', 'gripper_open',
-                  'recording_video_crf', 'return_to_zero_on_exit'}
+                  'recording_video_crf', 'return_to_zero_on_exit', 'rtc_delay_steps',
+                  'rtc_margin_steps', 'rtc_use_vjp'}
     for key, value in vars(args).items():
         if isinstance(value, (int, float)) and key not in exceptions:
             if not np.isfinite(value) or value <= 0:
@@ -971,6 +1218,20 @@ def parse_args():
         parser.error('motor-timeout-ms must be in [1, 32760]')
     if args.motor_timeout_ms <= 2000 / args.control_hz:
         parser.error('motor-timeout-ms must allow at least two control periods')
+    if not 0 <= args.rtc_delay_steps < 49 or args.rtc_margin_steps < 0:
+        parser.error('RTC delay must be 0..48; margin must be nonnegative')
+    if args.rtc_method != 'none' and args.inference_mode != 'async':
+        parser.error('RTC requires --inference-mode async')
+    if args.rtc_use_vjp and args.rtc_method != 'guidance':
+        parser.error('VJP requires RTC guidance')
+    if args.inference_mode == 'async' and args.mode == 'dry-run':
+        parser.error('Use smoke for hardware-free RTC or rollout for asynchronous execution')
+    if args.inference_mode == 'async':
+        try:
+            DelayBudget(args.control_hz, args.rtc_initial_delay_s,
+                        args.rtc_margin_steps, args.rtc_delay_steps).steps()
+        except RuntimeError as exc:
+            parser.error(str(exc))
     return args
 
 

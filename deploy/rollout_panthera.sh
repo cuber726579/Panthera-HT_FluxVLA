@@ -6,7 +6,7 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 CONDA_ROOT=/home/sunteng/miniconda3
 ROBOT_ENV=panthera
 POLICY_ENV=fluxvla
-MODE=check                         # check / smoke / dry-run / rollout
+MODE=rollout                         # check / smoke / dry-run / rollout
 SDK_ROOT=/home/sunteng/haoyun/Panthera-HT_SDK
 ROBOT_CONFIG="$SDK_ROOT/panthera_python/robot_param/Follower.yaml"
 MODEL_CONFIG="$ROOT/configs/pi05/pi05_paligemma_panthera_inference.py"
@@ -27,7 +27,15 @@ CAMERA_FPS=30
 CAMERA_TIMEOUT_MS=1000
 CAMERA_WARMUP_FRAMES=15
 CONTROL_HZ=30
-EXECUTE_STEPS=25                   # 模型每次预测 50 步，只执行前 10 步后重新观测
+EXECUTE_STEPS=20                   # sync: 每块执行步数；async: 两次推理起点间隔上限
+INFERENCE_MODE=${INFERENCE_MODE:-sync}  # sync / async；保持原同步默认行为
+RTC_METHOD=${RTC_METHOD:-none}     # none / guidance / prefix；RTC 要求 async
+RTC_DELAY_STEPS=${RTC_DELAY_STEPS:-0} # 0: 最近端到端延迟 P95 + 余量；其他值固定前缀
+RTC_INITIAL_DELAY_S=0.3            # 自动估计的初始延迟下限，不含首次模型预热
+RTC_MARGIN_STEPS=2
+RTC_DECAY_STEPS=8                  # guidance 前缀后逐渐减弱约束的步数
+RTC_GUIDANCE_WEIGHT=5.0
+RTC_USE_VJP=${RTC_USE_VJP:-0}       # 0: 近似 guidance；1: 梯度校正，需重新测延迟
 MAX_STEPS=600                      # 单次启动只跑一轮，不自动复位/重复
 SMOKE_CHUNKS=2
 POLICY_TIMEOUT_S=30
@@ -35,12 +43,12 @@ LOAD_TIMEOUT_S=180
 FEEDBACK_TIMEOUT_S=0.5
 MOTOR_TIMEOUT_MS=500               # 控制线程消失后由电机超时进入阻尼
 RETURN_TO_ZERO_ON_EXIT=1           # rollout 退出时回到 SDK 六关节零位；控制故障时跳过
-RETURN_ZERO_VELOCITY=0.3           # 回零速度上限 rad/s，同时受原控制速度/步长上限约束
+RETURN_ZERO_VELOCITY=0.5           # 回零速度上限 rad/s，同时受原控制速度/步长上限约束
 RETURN_ZERO_TIMEOUT_S=45           # 回零全过程超时，包含到位等待
 RETURN_ZERO_TOLERANCE=0.03         # 六关节实测到位容差 rad
-COMMAND_VELOCITY=0.25               # SDK 速度上限 rad/s
+COMMAND_VELOCITY=0.3               # SDK 速度上限 rad/s
 MAX_JOINT_STEP=0.04                # 同时受 COMMAND_VELOCITY/CONTROL_HZ 限制
-MAX_TARGET_JUMP=0.75               # 单条目标距上一命令过大则终止 rad
+MAX_TARGET_JUMP=1.75               # 单条目标距上一命令过大则终止 rad
 MAX_TRACKING_ERROR=0.35            # 已发送目标与实测位置差值上限 rad
 MAX_TORQUE=(21 36 36 21 10 10)     # Follower.yaml 上限
 JOINT_SIGNS=(1 1 1 1 1 1)         # policy = signs * (sdk - offsets)
@@ -60,6 +68,8 @@ RECORDING_FLUSH_TIMEOUT_S=30        # 退出时停止采集，再等待已接收
 # check: 依赖、权重头、预处理检查；smoke: 真实 CUDA + 合成观测，都不打开硬件。
 # dry-run: 打开两路相机和 SDK，读反馈并预测，不下发策略目标。
 # rollout: 控制线程持续保持上一目标；每次执行 EXECUTE_STEPS 后重新观测。
+# async: 推理期间继续执行缓冲轨迹；晚到结果丢弃，缓冲耗尽走原退出流程。
+# 示例: INFERENCE_MODE=async RTC_METHOD=guidance bash deploy/rollout_panthera.sh smoke
 # dry-run/rollout 都要求 SDK 串口空闲，不可与遥操作或机械臂后台服务共用。
 # rollout 正常结束、Ctrl+C 或上层异常退出时先回零，再调用 SDK set_stop。
 # 回零保持夹爪目标，期间忽略再次 Ctrl+C；电机/反馈/跟踪故障时直接停止，不回零。
@@ -83,6 +93,10 @@ exec "$CONDA_ROOT/envs/$ROBOT_ENV/bin/python" "$ROOT/deploy/rollout_panthera.py"
   --camera-fps "$CAMERA_FPS" --camera-timeout-ms "$CAMERA_TIMEOUT_MS" \
   --camera-warmup-frames "$CAMERA_WARMUP_FRAMES" \
   --control-hz "$CONTROL_HZ" --execute-steps "$EXECUTE_STEPS" \
+  --inference-mode "$INFERENCE_MODE" --rtc-method "$RTC_METHOD" \
+  --rtc-delay-steps "$RTC_DELAY_STEPS" --rtc-initial-delay-s "$RTC_INITIAL_DELAY_S" \
+  --rtc-margin-steps "$RTC_MARGIN_STEPS" --rtc-decay-steps "$RTC_DECAY_STEPS" \
+  --rtc-guidance-weight "$RTC_GUIDANCE_WEIGHT" --rtc-use-vjp "$RTC_USE_VJP" \
   --max-steps "$MAX_STEPS" --smoke-chunks "$SMOKE_CHUNKS" \
   --policy-timeout-s "$POLICY_TIMEOUT_S" --load-timeout-s "$LOAD_TIMEOUT_S" \
   --feedback-timeout-s "$FEEDBACK_TIMEOUT_S" --motor-timeout-ms "$MOTOR_TIMEOUT_MS" \

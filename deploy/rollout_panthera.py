@@ -25,7 +25,7 @@ import time
 
 import numpy as np
 
-from action_scheduler import ActionBuffer, DelayBudget, relative_rtc_actions
+from action_scheduler import ActionBuffer, DelayBudget, acceleration_step, relative_rtc_actions
 
 
 def vector(value, size, name):
@@ -75,6 +75,50 @@ def guard_target(desired, previous, measured, args, lower, upper):
     grip_limit = args.max_gripper_step * abs(args.gripper_open - args.gripper_closed)
     result[6] += np.clip(desired[6] - previous[6], -grip_limit, grip_limit)
     return result
+
+
+def smoothing_enabled(args):
+    return getattr(args, 'action_smoothing', 'none') == 'acceleration'
+
+
+def project_target(desired, previous, velocity, args, lower, upper):
+    """Plan in SDK coordinates without reading or mutating live controller state."""
+    # Retain raw prediction checks and the existing independent gripper limiter.
+    target = guard_target(desired, previous, previous, args, lower, upper)
+    if smoothing_enabled(args):
+        target[:6], next_velocity = acceleration_step(
+            desired[:6], previous[:6], velocity, dt=1 / args.control_hz,
+            max_velocity=min(args.command_velocity, args.max_joint_step * args.control_hz),
+            acceleration=args.command_acceleration, lower=lower, upper=upper)
+    else:
+        next_velocity = (target[:6] - previous[:6]) * args.control_hz
+    return target, next_velocity
+
+
+def validate_committed_target(target, velocity, previous, previous_velocity, measured,
+                              args, lower, upper):
+    """Validate, never reproject, a committed SDK command against live feedback."""
+    target = vector(target, 7, 'committed target')
+    velocity = vector(velocity, 6, 'committed velocity')
+    eps = 1e-9
+    if np.any(target[:6] < np.asarray(lower) - eps) or np.any(target[:6] > np.asarray(upper) + eps):
+        raise ValueError('Committed target outside SDK joint limits')
+    if not np.allclose((target[:6] - previous[:6]) * args.control_hz,
+                       velocity, atol=eps, rtol=0):
+        raise RuntimeError('Velocity does not match committed position trajectory')
+    speed = min(args.command_velocity, args.max_joint_step * args.control_hz)
+    if np.max(abs(velocity)) > speed + eps:
+        raise ValueError('Committed velocity exceeds configured limit')
+    if (smoothing_enabled(args)
+            and np.max(abs(velocity - previous_velocity)) > args.command_acceleration / args.control_hz + eps):
+        raise ValueError('Committed acceleration exceeds configured limit')
+    if (abs(target[6] - previous[6])
+            > args.max_gripper_step * abs(args.gripper_open - args.gripper_closed) + eps):
+        raise ValueError('Committed gripper step exceeds configured limit')
+    if np.max(abs(previous[:6] - measured[:6])) > args.max_tracking_error:
+        raise ValueError('Robot is not following the previous command')
+    if np.max(abs(target[:6] - measured[:6])) > args.max_tracking_error:
+        raise ValueError('Next command would exceed tracking-error limit')
 
 
 class Policy:
@@ -631,6 +675,7 @@ class RobotControl:
         self.async_events = queue.Queue(maxsize=4096)
         self.error = None
         self.measured = self.last_target = None
+        self.last_command_velocity = np.zeros(6)
         self.last_stamps = np.zeros(7)
         self.last_updates = np.full(7, time.monotonic())
         self.thread = threading.Thread(target=self._run, name='panthera-control', daemon=True)
@@ -663,6 +708,7 @@ class RobotControl:
 
     def _run(self):
         active = self.args.mode == 'rollout'
+        self.last_command_velocity = getattr(self, 'last_command_velocity', np.zeros(6))
         try:
             if self.robot.motor_count != 6:
                 raise RuntimeError('Only single 6-DOF Panthera + gripper is supported')
@@ -692,19 +738,32 @@ class RobotControl:
                         except queue.Empty:
                             pass
                     target = self.last_target.copy()
+                    target_velocity = np.zeros(6)
                     requested = buffered[0] if buffered is not None else (pending[0] if pending else None)
-                    if requested is not None:
+                    if buffered is not None:
+                        target = self.mapping.to_sdk(buffered[1])
+                        target_velocity = buffered[2]
+                        validate_committed_target(target, target_velocity, self.last_target,
+                                                  self.last_command_velocity, measured,
+                                                  self.args, lower, upper)
+                    elif buffer is not None and buffer.started and smoothing_enabled(self.args):
+                        # No more policy actions: brake while orchestration exits.
+                        target, target_velocity = project_target(
+                            target, self.last_target, self.last_command_velocity,
+                            self.args, lower, upper)
+                        validate_committed_target(target, target_velocity, self.last_target,
+                                                  self.last_command_velocity, measured,
+                                                  self.args, lower, upper)
+                    elif requested is not None:
                         target = guard_target(self.mapping.to_sdk(requested), target, measured,
                                               self.args, lower, upper)
+                        target_velocity = (target[:6] - self.last_target[:6]) * self.args.control_hz
                     if buffered is not None and not np.allclose(
                             self.mapping.to_policy(target), buffered[1], atol=1e-9, rtol=0):
                         raise RuntimeError('Command no longer matches committed RTC prefix')
                     if active:
                         if np.max(np.abs(target[:6] - measured[:6])) > self.args.max_tracking_error:
                             raise ValueError('Tracking error exceeds configured limit')
-                        target_velocity = np.clip(
-                            (target[:6] - self.last_target[:6]) * self.args.control_hz,
-                            -self.args.command_velocity, self.args.command_velocity)
                         if not self.robot.Joint_Pos_Vel(target[:6], target_velocity,
                                                         self.args.max_torque, iswait=False):
                             raise RuntimeError('SDK rejected joint command')
@@ -712,6 +771,7 @@ class RobotControl:
                                                            self.args.gripper_torque):
                             raise RuntimeError('SDK rejected gripper command')
                     self.measured, self.last_target = measured, target
+                    self.last_command_velocity = target_velocity.copy()
                     if buffered is not None:
                         step = buffer.cursor
                         buffer.advance(self.mapping.to_policy(target))
@@ -719,7 +779,8 @@ class RobotControl:
                             event='command', step=step, plan_version=buffer.version,
                             host_monotonic_ns=time.monotonic_ns(),
                             requested=requested.tolist(), sent=self.mapping.to_policy(target).tolist(),
-                            measured=self.mapping.to_policy(measured).tolist()))
+                            measured=self.mapping.to_policy(measured).tolist(),
+                            command_velocity_sdk=target_velocity.tolist()))
                 self.ready.set()
                 if pending is not None:
                     pending[1].set()
@@ -731,13 +792,15 @@ class RobotControl:
             try:
                 if active:
                     try:
+                        if self.error is None and smoothing_enabled(self.args):
+                            self._brake_to_hold()
                         if self.args.return_to_zero_on_exit and self.error is None:
                             self._return_to_zero()
                         elif self.args.return_to_zero_on_exit:
                             print(f'Return to zero skipped: control failed: {self.error}', flush=True)
                     except Exception as exc:
                         self.return_error = exc
-                        print(f'Return to zero failed: {exc}', file=sys.stderr, flush=True)
+                        print(f'Exit transition failed: {exc}', file=sys.stderr, flush=True)
                     finally:
                         try:
                             self.robot.set_stop()
@@ -747,13 +810,93 @@ class RobotControl:
             finally:
                 self.control_done.set()
 
+    def _send_transition(self, target, velocity, measured, event):
+        """Normal-stop/homing command; faults still go straight to SDK stop."""
+        lower, upper = self.robot.joint_limits['lower'], self.robot.joint_limits['upper']
+        validate_committed_target(target, velocity, self.last_target,
+                                  self.last_command_velocity, measured, self.args, lower, upper)
+        if self.home_abort.is_set():
+            raise RuntimeError('Return to zero / braking cancelled')
+        if not self.robot.Joint_Pos_Vel(target[:6], velocity, self.args.max_torque, iswait=False):
+            raise RuntimeError('SDK rejected transition joint command')
+        if not self.robot.gripper_control(target[6], 0., self.args.gripper_torque):
+            raise RuntimeError('SDK rejected transition gripper hold')
+        with self.lock:
+            self.measured, self.last_target = measured, target.copy()
+            self.last_command_velocity = velocity.copy()
+        # Separate file: run_async may have finished draining the policy log.
+        if getattr(self, 'transition_log_path', None) is not None:
+            with self.transition_log_path.open('a') as output:
+                output.write(json.dumps(dict(event=event, host_monotonic_ns=time.monotonic_ns(),
+                                            sent=self.mapping.to_policy(target).tolist(),
+                                            measured=self.mapping.to_policy(measured).tolist(),
+                                            command_velocity_sdk=velocity.tolist())) + '\n')
+
+    def _brake_to_hold(self):
+        if self.last_target is None:
+            return
+        deadline = time.monotonic() + self.args.return_zero_timeout_s
+        lower, upper = self.robot.joint_limits['lower'], self.robot.joint_limits['upper']
+        while np.max(abs(self.last_command_velocity)) > 1e-10:
+            if time.monotonic() >= deadline:
+                raise TimeoutError('Normal-stop braking timed out')
+            self.home_abort.wait(1 / self.args.control_hz)
+            measured = self.feedback()
+            if measured is None:
+                raise RuntimeError('Braking requires initialized feedback')
+            if np.any(measured[:6] < lower) or np.any(measured[:6] > upper):
+                raise ValueError('Braking: measured joints outside SDK limits')
+            target, velocity = project_target(self.last_target, self.last_target,
+                                              self.last_command_velocity, self.args, lower, upper)
+            self._send_transition(target, velocity, measured, 'brake')
+
+    def _return_to_zero_acceleration(self):
+        args = self.args
+        lower, upper = self.robot.joint_limits['lower'], self.robot.joint_limits['upper']
+        if np.any(np.asarray(lower) > 0) or np.any(np.asarray(upper) < 0):
+            raise ValueError('SDK zero pose is outside joint limits')
+        if self.last_target is None:
+            self.last_target = self.feedback()
+            if self.last_target is None:
+                raise RuntimeError('Return to zero requires initialized feedback')
+            self.last_command_velocity = np.zeros(6)
+        # Use the same speed bound as rollout until any preexisting speed has
+        # decelerated to the return speed (normally _brake_to_hold already ran).
+        self._brake_to_hold()
+        speed = min(args.return_zero_velocity, args.command_velocity, args.max_joint_step * args.control_hz)
+        deadline, settled = time.monotonic() + args.return_zero_timeout_s, None
+        while True:
+            tick = time.monotonic()
+            if tick >= deadline:
+                raise TimeoutError('Return to zero timed out before measured joints settled')
+            if self.home_abort.is_set():
+                raise RuntimeError('Return to zero cancelled')
+            measured = self.feedback()
+            if measured is None:
+                raise RuntimeError('Return to zero requires initialized feedback')
+            if np.any(measured[:6] < lower) or np.any(measured[:6] > upper):
+                raise ValueError('Return to zero: measured joints outside SDK limits')
+            target = self.last_target.copy()
+            target[:6], velocity = acceleration_step(
+                np.zeros(6), target[:6], self.last_command_velocity, dt=1 / args.control_hz,
+                max_velocity=speed, acceleration=args.command_acceleration, lower=lower, upper=upper)
+            self._send_transition(target, velocity, measured, 'return_zero')
+            reached = (np.max(abs(target[:6])) < 1e-9 and np.max(abs(velocity)) < 1e-9
+                       and np.max(abs(measured[:6])) <= args.return_zero_tolerance)
+            settled = (tick if settled is None else settled) if reached else None
+            if settled is not None and tick - settled >= .2:
+                print(f'Return to zero complete; measured joints={measured[:6].tolist()}', flush=True)
+                return
+            self.home_abort.wait(max(0, 1 / args.control_hz - (time.monotonic() - tick)))
+
     def _return_to_zero(self):
         """Return six SDK joint coordinates to zero; keep the gripper target.
 
-        Use the SDK's septic_interpolation, with all SDK access still owned by
-        this thread. Refresh commands/feedback throughout the motor watchdog
-        interval, and stop on faults, stale feedback, tracking error or timeout.
+        Use acceleration projection when enabled, otherwise SDK septic interpolation.
+        This thread owns SDK access, refreshes feedback and checks faults/timeouts.
         """
+        if smoothing_enabled(self.args):
+            return self._return_to_zero_acceleration()
         args = self.args
         if self.home_abort.is_set():
             raise RuntimeError('Return to zero cancelled')
@@ -846,16 +989,19 @@ class RobotControl:
             keep = reservation.boundary - buffer.cursor
             previous = (self.mapping.to_sdk(buffer.effective[keep - 1])
                         if keep else self.last_target.copy())
+            velocity = (buffer.velocities[keep - 1].copy() if keep
+                        else self.last_command_velocity.copy())
             requested = actions[reservation.prefix_len:]
-            effective = []
+            effective, velocities = [], []
             lower, upper = self.robot.joint_limits['lower'], self.robot.joint_limits['upper']
             for action in requested:
-                # Same command projection as the live path; measured-state
-                # guards are still applied independently at every real tick.
-                previous = guard_target(self.mapping.to_sdk(action), previous, previous,
-                                        self.args, lower, upper)
+                # Commit positions AND velocities; the live path validates
+                # against real feedback without projecting these a second time.
+                previous, velocity = project_target(self.mapping.to_sdk(action), previous, velocity,
+                                                     self.args, lower, upper)
                 effective.append(self.mapping.to_policy(previous))
-            return buffer.install(reservation, requested, effective)
+                velocities.append(velocity.copy())
+            return buffer.install(reservation, requested, effective, velocities)
 
     def send(self, action):
         done = threading.Event()
@@ -1126,6 +1272,7 @@ def run(args):
         cameras = Cameras(args, log_dir if args.save_observations else None)
         register_cleanup(stack, cameras, 'cameras', log_dir)
         robot = RobotControl(args, mapping)
+        robot.transition_log_path = log_dir / 'transitions.jsonl'
         register_cleanup(stack, robot, 'robot', log_dir)
         robot.ready.wait(args.feedback_timeout_s + 1)
         measured, previous = robot.snapshot()
@@ -1177,6 +1324,9 @@ def parse_args():
     parser.add_argument('--return-zero-timeout-s', type=float, default=45.0)
     parser.add_argument('--return-zero-tolerance', type=float, default=0.03)
     parser.add_argument('--inference-mode', choices=['sync', 'async'], default='sync')
+    parser.add_argument('--action-smoothing', choices=['none', 'acceleration'], default='none')
+    parser.add_argument('--command-acceleration', type=float, default=1.5,
+                        help='Six-joint nominal command acceleration bound in rad/s^2')
     parser.add_argument('--rtc-method', choices=['none', 'guidance', 'prefix'], default='none')
     parser.add_argument('--rtc-delay-steps', type=int, default=0,
                         help='0 estimates delay from recent end-to-end latency')
@@ -1222,6 +1372,8 @@ def parse_args():
         parser.error('RTC delay must be 0..48; margin must be nonnegative')
     if args.rtc_method != 'none' and args.inference_mode != 'async':
         parser.error('RTC requires --inference-mode async')
+    if smoothing_enabled(args) and args.inference_mode != 'async':
+        parser.error('Acceleration smoothing currently requires --inference-mode async')
     if args.rtc_use_vjp and args.rtc_method != 'guidance':
         parser.error('VJP requires RTC guidance')
     if args.inference_mode == 'async' and args.mode == 'dry-run':

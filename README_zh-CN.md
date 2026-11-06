@@ -1136,18 +1136,18 @@ INFERENCE_MODE=async RTC_METHOD=guidance bash deploy/rollout_panthera.sh rollout
 # 对照：仅异步，不使用 RTC
 INFERENCE_MODE=async RTC_METHOD=none bash deploy/rollout_panthera.sh rollout
 
-# 恢复同步执行
-INFERENCE_MODE=sync RTC_METHOD=none bash deploy/rollout_panthera.sh rollout
+# 同步对照使用未启用平滑的同步配置
+INFERENCE_MODE=sync RTC_METHOD=none bash deploy/rollout_panthera.sh rollout --config deploy/config/openpi_panthera_15000.yaml
 ```
 
 模型仍输出 50 步。同步模式的 `rollout.execute_steps` 是每块执行步数；异步模式中它是
-两次推理起点之间的动作步数上限，缓冲不足时会提前推理。控制线程在推理期间
-继续执行旧轨迹，每周期执行一个 action，不改变现有关节/夹爪限幅规则。
+两次推理起点之间的目标动作步数间隔，缓冲不足时会提前推理；上一请求尚未完成时
+会延后。控制线程在推理期间继续执行旧轨迹，每周期执行一个 action。
 
 `RTC_DELAY_STEPS=0` 按最近 20 次请求端到端延迟的 P95、初始下限及
 `rollout.rtc_margin_steps` 估算预留前缀；首次模型预热不计入。设为 1～48 可固定长度。
 只有一个推理请求在途，新结果只替换预定切换边界以后的动作；晚到结果丢弃。
-缓冲耗尽时保持上一目标并退出到原清理流程，不重复播放旧动作。
+缓冲耗尽时退出清理流程，不重复播放旧动作；开启加速度平滑时先按下述规则制动。
 该流程不会修复已有的反馈超时或回零故障。
 
 RTC 条件取自限幅后计划下发的绝对目标，按本次输入状态重算前六维增量，
@@ -1162,6 +1162,41 @@ RTC 条件取自限幅后计划下发的绝对目标，按本次输入状态重�
 `rollout.jsonl` 新增 `inference_request`，预测记录含 `origin`、`boundary`、
 `accepted`、`discard_reason`、`end_to_end_s` 和实际启用的 `rtc_method`。
 动作记录含单调时钟时间和轨迹版本；步数指已下发动作，不代表物理到位。
+
+### 动作加速度限制与离线回放
+
+`openpi_panthera_15000_async.yaml` 启用 `action_smoothing: acceleration`，
+`command_acceleration: 1.5`（rad/s²）是离线候选值，尚未实机验证。
+命令行默认 `action_smoothing=none`，保留旧配置的行为；加速度平滑仅支持异步模式。
+需要同步对照时同时设置 `action_smoothing: none` 和 `rtc_method: none`。
+
+新预测提交到动作缓冲之前，从保留前缀末端的位置和指令速度开始，逐步限制速度变化，
+并使用离散制动距离控制目标附近的减速与关节限位前的制动。前缀的位置、速度保持不变；
+下一次 RTC 使用平滑后的 `effective` 轨迹。控制线程直接执行缓冲中的位置/速度，
+保留实时反馈、跟踪误差和限位检查，不在执行时再次滤波。六关节速度上限仍是
+`min(command_velocity, max_joint_step * control_hz)`；夹爪继续独立限幅。
+新目标落在当前制动距离内时，可能越过新参考点后再返回，但不允许突破硬关节限位。
+
+正常结束、Ctrl+C、上层退出及缓冲耗尽时，控制线程先把指令速度降到零；配置启用回零时，
+继续以速度/加速度受限的轨迹回零并检查实测到位。电机、反馈或跟踪故障直接走停止路径，
+不会为了平滑而延后故障停止。正常制动/回零阶段保持夹爪目标，不消耗策略 action 步数。
+`rollout.jsonl` 的 `command_velocity_sdk` 记录六关节指令速度；
+`transitions.jsonl` 单独记录正常退出时的制动和回零指令。
+约束针对 `1/control_hz` 的名义指令周期，不等于电机实测加速度或实时调度保证。
+
+下面的回放只读取日志和机器人 YAML 限位，不加载 SDK、模型或相机：
+
+```bash
+python deploy/replay_action_smoothing.py \
+  deploy/runs/20261106_141820_rollout_3858124 \
+  deploy/runs/20261106_142314_rollout_3872904 \
+  --acceleration 1.5 --output /tmp/panthera_acceleration_replay
+```
+
+先验证关闭平滑能够逐步复现历史下发动作，再使用同一批预测和原安装版本回放平滑路径，
+检查前缀不变、速度/加速度界限及正常结束制动，输出 JSON 指标和 NPZ 曲线。
+这是固定预测、理想反馈的离线验证；历史实测反馈只用于差异统计，不能作为新轨迹的
+跟踪效果，也不能据此判断真实抓取成功率。`smoke` 仅验证模型路径，不替代控制平滑测试。
 
 ```bash
 # 无硬件的调度、IPC、退出与原控制回归测试

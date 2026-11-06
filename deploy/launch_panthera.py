@@ -11,7 +11,7 @@ import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CONFIG = ROOT / 'deploy/config/openpi_panthera_15000.yaml'
+DEFAULT_CONFIG = ROOT / 'deploy/config/openpi_panthera_15000_async.yaml'
 PATH_OPTIONS = {'robot_config', 'model_config', 'checkpoint', 'statistics',
                 'tokenizer_root', 'log_root', 'policy_python'}
 ENV_OVERRIDES = ('INFERENCE_MODE', 'RTC_METHOD', 'RTC_DELAY_STEPS', 'RTC_USE_VJP')

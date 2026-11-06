@@ -1,0 +1,80 @@
+# 启动环境。读取此文件的 python3 需要 PyYAML；实际控制和推理使用下面的环境。
+runtime:
+  conda_root: /home/sunteng/miniconda3
+  robot_env: panthera
+  policy_env: fluxvla
+  cuda_device: "0"
+
+# 键名对应 rollout_panthera.py 的命令行参数（下划线转连字符）。
+# 路径支持 ${ROOT}（仓库根目录）、${SDK_ROOT} 和 ~；相对路径以仓库根目录为基准。
+rollout:
+  mode: rollout                    # check / smoke / dry-run / rollout
+  sdk_root: /home/sunteng/haoyun/Panthera-HT_SDK
+  robot_config: ${SDK_ROOT}/panthera_python/robot_param/Follower.yaml
+  model_config: ${ROOT}/configs/pi05/pi05_paligemma_panthera_inference.py
+  checkpoint: ${ROOT}/checkpoints/openpi_panthera_15000/model.safetensors
+  statistics: ${ROOT}/checkpoints/dataset_statistics.json
+  tokenizer_root: ${ROOT}/checkpoints/openpi_panthera_15000
+  param_dtype: checkpoint           # 保留原 BF16/FP32 混合精度；也可设 fp32
+  seed: 7
+  denoise_steps: 10
+  instruction: "Pick the white cylindrical bottle up and set it onto the pad"
+  state_source: previous-target     # 可显式改 measured 做对照
+
+  # 相机序列号使用字符串；需确认实物对应关系。
+  head_serial: "153122074552"
+  wrist_serial: "260522273111"
+  camera_width: 640
+  camera_height: 480
+  camera_fps: 30
+  camera_timeout_ms: 1000
+  camera_warmup_frames: 15
+
+  control_hz: 30
+  execute_steps: 20                 # sync: 每块执行步数；async: 推理起点间隔上限
+  inference_mode: async              # sync / async；支持 INFERENCE_MODE 环境变量覆盖
+  action_smoothing: acceleration     # none / acceleration；提交缓冲前平滑，保持 RTC 前缀一致
+  command_acceleration: 1.5          # 六关节指令加速度上限 rad/s²；离线候选，尚未实机验证
+  rtc_method: none                  # none / guidance / prefix；RTC 要求 async
+  rtc_delay_steps: 0                # 0: 延迟 P95 + 余量；1..48: 固定前缀
+  rtc_initial_delay_s: 0.25          # 自动估计的初始下限，不含首次模型预热
+  rtc_margin_steps: 2
+  rtc_decay_steps: 8                # guidance 前缀后逐渐减弱约束的步数
+  rtc_guidance_weight: 5.0
+  rtc_use_vjp: 0                    # 0: 近似 guidance；1: 梯度校正，需重新测延迟
+  max_steps: 1000                    # 单次启动只跑一轮，不自动复位/重复
+  smoke_chunks: 2
+  policy_timeout_s: 30
+  load_timeout_s: 180
+  feedback_timeout_s: 1.0
+  motor_timeout_ms: 500             # 控制线程消失后由电机超时进入阻尼
+
+  # rollout 正常结束、Ctrl+C 或上层异常退出时先回零，再调用 SDK set_stop。
+  # 回零保持夹爪目标；电机/反馈/跟踪故障时直接停止，不回零。
+  # SDK 析构还会执行 robot_config 中的 exit_motor_brake_flag 行为。
+  return_to_zero_on_exit: 1
+  return_zero_velocity: 0.3         # 同时受 command_velocity / max_joint_step 限制
+  return_zero_timeout_s: 45
+  return_zero_tolerance: 0.03        # 六关节实测到位容差 rad
+  command_velocity: 0.3             # SDK 速度上限 rad/s
+  max_joint_step: 0.04              # 同时受 command_velocity / control_hz 限制
+  max_target_jump: 1.75             # 单条目标距上一命令过大则终止 rad
+  max_tracking_error: 0.35          # 已发送目标与实测位置差值上限 rad
+  max_torque: [21, 36, 36, 21, 10, 10]
+  joint_signs: [1, 1, 1, 1, 1, 1]   # policy = signs * (sdk - offsets)
+  joint_offsets: [0, 0, 0, 0, 0, 0] # 尚未做仿真/实机零位标定
+  gripper_closed: 0.0
+  gripper_open: 1.6                 # 需按实物标定
+  gripper_velocity: 0.5
+  gripper_torque: 0.5
+  max_gripper_step: 0.05            # 每控制周期，模型归一化单位
+
+  log_root: ${ROOT}/deploy/runs
+  save_observations: 1              # 双路 H.264 MP4、逐帧时间戳及原始 NPZ；需 ffmpeg/libx264
+  recording_queue_size: 128         # 两路共享队列；满时明确报错并停止
+  recording_video_crf: 23           # 0..51；越小画质越高，NPZ 保留原始 RGB
+  recording_flush_timeout_s: 30     # 等待已接收帧写完；超时报告保存不完整
+
+# check / smoke 不打开硬件；dry-run 打开相机和 SDK，但不下发策略目标。
+# dry-run / rollout 要求串口空闲，不可与遥操作或机械臂后台服务共用。
+# 本地数据来自仿真；相机摆位、关节符号/零位、夹爪行程需按实机对齐。

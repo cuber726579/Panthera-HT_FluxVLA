@@ -9,6 +9,56 @@ import math
 import numpy as np
 
 
+def braking_speed(distance, dt, acceleration):
+    """Largest next speed whose discrete braking tail fits in distance.
+
+    The tail includes this tick's displacement: dt * sum(max(v-i*a*dt, 0)).
+    This is deliberately discrete, rather than sqrt(2*a*d), which can cross
+    a limit by one tick. All calculations are in SDK joint coordinates.
+    """
+    distance = np.maximum(distance, 0.)
+    dv = acceleration * dt
+    n = np.maximum(1., np.ceil((np.sqrt(1. + 8. * distance / (dv * dt)) - 1.) / 2.))
+    return (distance / dt + dv * n * (n - 1.) / 2.) / n
+
+
+def acceleration_step(desired, previous, velocity, *, dt, max_velocity,
+                      acceleration, lower, upper):
+    """Project one six-joint reference with braking and acceleration bounds.
+
+    Retargeting inside the stopping distance may overshoot the *reference*;
+    hard joint limits must remain reachable under braking, or we fail closed.
+    Limits concern nominal command ticks, not measured motor acceleration.
+    """
+    desired, previous, velocity, lower, upper = [
+        np.asarray(x, dtype=np.float64) for x in (desired, previous, velocity, lower, upper)]
+    if any(x.shape != (6,) or not np.isfinite(x).all()
+           for x in (desired, previous, velocity, lower, upper)):
+        raise ValueError('Acceleration projection requires six finite joint values')
+    if (not np.isfinite([dt, max_velocity, acceleration]).all()
+            or min(dt, max_velocity, acceleration) <= 0 or np.any(lower >= upper)):
+        raise ValueError('Invalid acceleration projection limits')
+    eps = 1e-10
+    if (np.any(previous < lower - eps) or np.any(previous > upper + eps)
+            or np.any(desired < lower) or np.any(desired > upper)
+            or np.any(np.abs(velocity) > max_velocity + eps)):
+        raise ValueError('Acceleration projection starts outside limits')
+    dv = acceleration * dt
+    low = np.maximum.reduce((np.full(6, -max_velocity), velocity - dv,
+                             -braking_speed(previous - lower, dt, acceleration)))
+    high = np.minimum.reduce((np.full(6, max_velocity), velocity + dv,
+                              braking_speed(upper - previous, dt, acceleration)))
+    if np.any(low > high + eps):
+        raise ValueError('No feasible braking trajectory before joint limit')
+    error = desired - previous
+    wanted = np.sign(error) * np.minimum(max_velocity, braking_speed(abs(error), dt, acceleration))
+    projected_velocity = np.clip(wanted, low, np.maximum(low, high))
+    projected = previous + projected_velocity * dt
+    if np.any(projected < lower - eps) or np.any(projected > upper + eps):
+        raise ValueError('Projected command outside joint limits')
+    return projected, projected_velocity
+
+
 @dataclass(frozen=True)
 class Reservation:
     version: int
@@ -27,6 +77,8 @@ class ActionBuffer:
         self.version = 0
         self.requested = np.empty((0, 7))
         self.effective = np.empty((0, 7))
+        # SDK-coordinate velocities; effective positions are policy-coordinate.
+        self.velocities = np.empty((0, 6))
         self.started = False
 
     @property
@@ -44,7 +96,7 @@ class ActionBuffer:
         return (reservation.version == self.version
                 and self.cursor <= reservation.boundary)
 
-    def install(self, reservation, requested, effective):
+    def install(self, reservation, requested, effective, velocities=None):
         if not self.accepts(reservation):
             return False
         requested, effective = np.asarray(requested), np.asarray(effective)
@@ -52,12 +104,17 @@ class ActionBuffer:
                 or requested.shape[1] != 7 or not len(requested)
                 or not np.isfinite(requested).all() or not np.isfinite(effective).all()):
             raise ValueError('Invalid action buffer')
+        # Optional for legacy buffer-only callers; controller always supplies it.
+        velocities = np.zeros((len(requested), 6)) if velocities is None else np.asarray(velocities)
+        if velocities.shape != (len(requested), 6) or not np.isfinite(velocities).all():
+            raise ValueError('Invalid buffered velocities')
         keep = reservation.boundary - self.cursor
         if keep > self.remaining:
             return False
         capacity = self.max_steps - self.cursor
         self.requested = np.concatenate((self.requested[:keep], requested))[:capacity].copy()
         self.effective = np.concatenate((self.effective[:keep], effective))[:capacity].copy()
+        self.velocities = np.concatenate((self.velocities[:keep], velocities))[:capacity].copy()
         self.version += 1
         self.started = True
         return True
@@ -65,7 +122,7 @@ class ActionBuffer:
     def peek(self):
         if not self.remaining:
             return None
-        return self.requested[0].copy(), self.effective[0].copy()
+        return self.requested[0].copy(), self.effective[0].copy(), self.velocities[0].copy()
 
     def advance(self, actual):
         if not self.remaining:
@@ -74,6 +131,7 @@ class ActionBuffer:
             raise RuntimeError('Executed target differs from committed RTC trajectory')
         self.requested = self.requested[1:]
         self.effective = self.effective[1:]
+        self.velocities = self.velocities[1:]
         self.cursor += 1
 
 

@@ -1,0 +1,169 @@
+# Panthera pi0.5 deployment dependencies, captured from the fluxvla Conda env.
+# Snapshot: 2026-11-06; Linux x86_64; Python 3.10.21; PyTorch CUDA 12.8.
+# Versions exclude ~/.local user-site packages. This is a deployment subset,
+# not a freeze of the mixed training/simulation environment.
+# Includes transitive dependencies and packages needed by eager FluxVLA imports.
+# Excludes TensorFlow, GR00T, LIBERO, RoboCasa, ROS and GCS integrations.
+# Validated against installed metadata and imports, not a fresh installation.
+#
+# Setup in a NEW environment, from the FluxVLA repository root:
+#   export PYTHONNOUSERSITE=1
+#   conda install -c conda-forge python=3.10.21 ffmpeg=7.1.1
+#   conda install -c nvidia cuda-nvcc=12.8.93
+# Also provide a compatible NVIDIA driver, C/C++ compiler and git.
+# FFmpeg must provide libx264 for deployment camera recording.
+#
+# Install PyTorch before FlashAttention (building it may import torch):
+#   python -m pip install torch==2.8.0+cu128 torchvision==0.23.0+cu128 torchaudio==2.8.0+cu128 --index-url https://download.pytorch.org/whl/cu128
+# Prefer the matching prebuilt FlashAttention wheel, installed with --no-deps:
+#   flash_attn-2.8.3.post1+cu12torch2.8cxx11abiTRUE-cp310-cp310-linux_x86_64.whl
+# The source machine caches this under ~/.cache/fluxvla/wheels/.
+# Without that wheel, flash-attn below may require a separate source build
+# after installing its build dependencies, using --no-build-isolation.
+# Then install the remaining dependencies and compile the local FluxVLA ops:
+#   python -m pip install -r requirements-deploy.txt
+#   python -m pip install --no-build-isolation --no-deps -e .
+#
+# Robot control additionally needs Panthera-HT_SDK and its local SDK wheel:
+#   Panthera-HT_SDK/panthera_python/motor_whl/hightorque_robot-1.2.0-cp310-cp310-linux_x86_64.whl
+# This wheel reports distribution version 1.0.0 despite its 1.2.0 filename;
+# install the supplied wheel rather than resolving hightorque_robot from PyPI.
+# Expose the SDK's panthera_python/scripts directory on PYTHONPATH.
+# If rollout uses a separate panthera environment, install SDK/control deps
+# there too; this file snapshots the fluxvla policy environment only.
+#
+# CUDA wheels are hosted on the PyTorch index; ordinary packages use PyPI.
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+# CUDA inference stack (Linux x86_64, CPython 3.10)
+torch==2.8.0+cu128
+torchvision==0.23.0+cu128
+torchaudio==2.8.0+cu128
+flash_attn==2.8.3.post1
+
+# Policy, configuration and eager FluxVLA imports
+accelerate==0.33.0
+transformers==5.3.0
+diffusers @ git+https://github.com/huggingface/diffusers.git@3996788b602eaae4da41a1d45726b62e662b73cf
+peft==0.19.1
+mmengine==0.10.7
+astunparse==1.6.3
+einops==0.4.1
+safetensors==0.8.0
+sentencepiece==0.1.99
+numpy==1.26.4
+PyYAML==6.0.1
+scipy==1.15.3
+datasets==4.0.0
+timm==0.9.10
+wandb==0.21.0
+cloudpickle==3.1.2
+jsonlines==4.0.0
+
+# Images, video, RealSense and checkpoint downloads
+pyrealsense2==2.58.4.10922
+opencv-python==4.11.0.86
+pillow==12.3.0
+av==14.2.0
+ImageIO==2.37.4
+imageio-ffmpeg==0.6.0
+torchcodec==0.7.0
+boto3==1.38.32
+botocore==1.38.32
+types-boto3-s3==1.38.26
+tqdm-loggable==0.2
+
+# Build helpers for the separate editable FluxVLA install
+setuptools==84.0.0
+wheel==0.48.0
+
+# Transitive runtime dependencies (pinned to this environment)
+addict==2.4.0
+aiohappyeyeballs==2.7.1
+aiohttp==3.14.3
+aiosignal==1.4.0
+annotated-doc==0.0.5
+annotated-types==0.8.0
+anyio==4.14.2
+async-timeout==5.0.1
+attrs==26.1.0
+certifi==2026.7.22
+charset-normalizer==3.5.1
+click==8.5.0
+contourpy==1.3.2
+cycler==0.12.1
+dill==0.3.8
+exceptiongroup==1.3.1
+filelock==3.32.3
+fonttools==4.63.0
+frozenlist==1.8.0
+fsspec==2025.3.0
+gitdb==4.0.12
+GitPython==3.1.61
+h11==0.16.0
+hf-xet==1.6.0
+httpcore==1.0.9
+httpx==0.28.1
+huggingface_hub==1.29.0
+idna==3.19
+importlib_metadata==9.0.1
+Jinja2==3.1.6
+jmespath==1.1.0
+kiwisolver==1.5.1
+markdown-it-py==4.2.0
+MarkupSafe==3.0.3
+matplotlib==3.10.9
+mdurl==0.1.2
+mpmath==1.3.0
+multidict==6.7.1
+multiprocess==0.70.16
+networkx==3.4.2
+nvidia-cublas-cu12==12.8.4.1
+nvidia-cuda-cupti-cu12==12.8.90
+nvidia-cuda-nvrtc-cu12==12.8.93
+nvidia-cuda-runtime-cu12==12.8.90
+nvidia-cudnn-cu12==9.10.2.21
+nvidia-cufft-cu12==11.3.3.83
+nvidia-cufile-cu12==1.13.1.3
+nvidia-curand-cu12==10.3.9.90
+nvidia-cusolver-cu12==11.7.3.90
+nvidia-cusparse-cu12==12.5.8.93
+nvidia-cusparselt-cu12==0.7.1
+nvidia-nccl-cu12==2.27.3
+nvidia-nvjitlink-cu12==12.8.93
+nvidia-nvtx-cu12==12.8.90
+packaging==26.3
+pandas==2.3.3
+platformdirs==4.11.5
+propcache==0.5.2
+protobuf==4.25.9
+psutil==7.2.2
+pyarrow==25.0.1
+pydantic==2.7.1
+pydantic_core==2.18.2
+Pygments==2.21.0
+pyparsing==3.3.2
+python-dateutil==2.9.0.post0
+pytz==2026.3.post1
+regex==2026.7.19
+requests==2.34.2
+rich==15.0.0
+s3transfer==0.13.1
+sentry-sdk==2.27.0
+shellingham==1.5.4
+six==1.17.0
+smmap==5.0.3
+sympy==1.14.0
+termcolor==3.3.0
+tokenizers==0.22.2
+tomli==2.2.1
+tqdm==4.70.0
+triton==3.4.0
+typer==0.26.8
+typing_extensions==4.16.0
+tzdata==2026.3
+urllib3==2.7.0
+xxhash==4.0.1
+yapf==0.43.0
+yarl==1.24.5
+zipp==4.1.0

@@ -31,11 +31,11 @@ rollout:
   camera_warmup_frames: 15
 
   control_hz: 30
-  execute_steps: 20                 # sync: 每块执行步数；async: 推理起点间隔上限
+  execute_steps: 15                 # sync: 每块执行步数；async: 推理起点间隔上限
   inference_mode: async              # sync / async；支持 INFERENCE_MODE 环境变量覆盖
   action_smoothing: acceleration     # none / acceleration；提交缓冲前平滑，保持 RTC 前缀一致
   command_acceleration: 1.5          # 六关节指令加速度上限 rad/s²；离线候选，尚未实机验证
-  rtc_method: none                  # none / guidance / prefix；RTC 要求 async
+  rtc_method: prefix                  # none / guidance / prefix；RTC 要求 async
   rtc_delay_steps: 0                # 0: 延迟 P95 + 余量；1..48: 固定前缀
   rtc_initial_delay_s: 0.25          # 自动估计的初始下限，不含首次模型预热
   rtc_margin_steps: 2
